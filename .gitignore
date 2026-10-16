@@ -1,0 +1,12 @@
+# Build output
+/build/
+/build-*/
+/out/
+compile_commands.json
+
+# Editor and OS files
+.cache/
+.vscode/
+.idea/
+.DS_Store
+*.swp

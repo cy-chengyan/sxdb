@@ -1,0 +1,29 @@
+---
+# Static analysis rules for sxdb. See docs/DESIGN.md section 15.2.
+# Mandatory braces and one variable per declaration are errors; everything else is a warning.
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  cert-*,
+  clang-analyzer-*,
+  misc-redundant-expression,
+  misc-misplaced-const,
+  performance-*,
+  portability-*,
+  readability-braces-around-statements,
+  readability-isolate-declaration,
+  readability-misleading-indentation,
+  readability-inconsistent-declaration-parameter-name
+
+WarningsAsErrors: >
+  readability-braces-around-statements,
+  readability-isolate-declaration
+
+HeaderFilterRegex: '.*/(src|include|tools|tests)/.*'
+
+CheckOptions:
+  - key: readability-braces-around-statements.ShortStatementLines
+    value: 0
+...

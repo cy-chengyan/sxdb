@@ -1,0 +1,97 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Continuous integration. See docs/DESIGN.md section 15.3.
+# Third-party actions are pinned by commit SHA; the comment names the release.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  source-checks:
+    name: source checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Source rules (ASCII, banned functions, SPDX, layering)
+        run: scripts/check-source.sh
+      - name: Install clang-format
+        run: sudo apt-get update && sudo apt-get install -y clang-format
+      - name: Formatting
+        run: |
+          find src include tests tools -name '*.[ch]' -print0 \
+            | xargs -0 clang-format --dry-run --Werror
+
+  build-and-test:
+    name: ${{ matrix.os }} ${{ matrix.cc }} ${{ matrix.variant }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, cc: gcc, variant: release }
+          - { os: ubuntu-24.04, cc: clang, variant: release }
+          - { os: ubuntu-24.04-arm, cc: gcc, variant: release }
+          - { os: ubuntu-24.04, cc: gcc, variant: c23 }
+          - { os: ubuntu-24.04, cc: clang, variant: asan-ubsan }
+          - { os: ubuntu-24.04, cc: clang, variant: tsan }
+          - { os: macos-15, cc: clang, variant: release }
+          - { os: macos-15-intel, cc: clang, variant: release }
+    env:
+      CC: ${{ matrix.cc }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Configure
+        run: |
+          case "${{ matrix.variant }}" in
+            release)    extra="-DCMAKE_BUILD_TYPE=Release" ;;
+            c23)        extra="-DCMAKE_BUILD_TYPE=Release -DCMAKE_C_STANDARD=23" ;;
+            asan-ubsan) extra="-DCMAKE_BUILD_TYPE=Debug -DSXDB_SANITIZE=address,undefined" ;;
+            tsan)       extra="-DCMAKE_BUILD_TYPE=Debug -DSXDB_SANITIZE=thread" ;;
+          esac
+          cmake -S . -B build -DSXDB_WERROR=ON $extra
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Unit tests
+        run: ctest --test-dir build --output-on-failure
+      - name: Benchmark smoke test
+        if: matrix.variant == 'release'
+        run: build/tools/sxdb-bench/sxdb-bench --values 65536 --min-time 0.01
+
+  clang-tidy:
+    name: clang-tidy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install clang-tidy
+        run: sudo apt-get update && sudo apt-get install -y clang clang-tidy
+      - name: Configure
+        run: CC=clang cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+      - name: Analyze
+        run: |
+          find src tests tools -name '*.c' -print0 \
+            | xargs -0 -n 8 -P "$(nproc)" clang-tidy -p build --quiet
+
+  codeql:
+    name: CodeQL
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: github/codeql-action/init@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          languages: c-cpp
+          build-mode: manual
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel
+      - uses: github/codeql-action/analyze@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
