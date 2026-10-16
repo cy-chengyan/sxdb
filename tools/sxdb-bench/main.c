@@ -31,9 +31,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define ENCODING_ID_COUNT     11u
-#define DEFAULT_VALUE_COUNT   (1u << 20)
-#define DEFAULT_MIN_SECONDS   0.25
+#define ENCODING_ID_COUNT   11u
+#define DEFAULT_VALUE_COUNT (1u << 20)
+#define DEFAULT_MIN_SECONDS 0.25
 
 typedef struct bench_options {
     uint32_t value_count;
@@ -230,8 +230,8 @@ static double seconds_since(uint64_t start_ns) {
 }
 
 /* Runs one pass to warm up, then repeats until `min_seconds` have passed. */
-static bool time_encoding(const bench_column* column, encoded_column* encoded,
-                          double min_seconds, double* seconds_per_pass) {
+static bool time_encoding(const bench_column* column, encoded_column* encoded, double min_seconds,
+                          double* seconds_per_pass) {
     if (!encode_pass(column, encoded)) {
         return false;
     }
@@ -266,7 +266,8 @@ static bool time_decoding(const bench_column* column, const encoded_column* enco
 
 static bool run_benchmark(const bench_column* column, double min_seconds, bench_result* result) {
     memset(result, 0, sizeof(*result));
-    encoded_column encoded;
+    /* Zeroed first: the cleanup below runs even if an allocation fails before init. */
+    encoded_column encoded = {0};
     decode_buffers* buffers = calloc(1, sizeof(*buffers));
     bool ok = buffers != NULL && encoded_column_init(&encoded, column);
     if (ok && column->type == BENCH_TYPE_STRING) {
@@ -299,10 +300,10 @@ static bool run_benchmark(const bench_column* column, double min_seconds, bench_
 /* ---------------------------------------------------------------------------------------- */
 
 static void print_header(void) {
-    printf("%-18s %-7s %9s %9s %8s %10s %10s %10s  %s\n", "dataset", "type", "values",
-           "bytes/val", "ratio", "enc MB/s", "dec MB/s", "dec Mval/s", "encodings");
-    printf("%-18s %-7s %9s %9s %8s %10s %10s %10s  %s\n", "-------", "----", "------",
-           "---------", "-----", "--------", "--------", "----------", "---------");
+    printf("%-18s %-7s %9s %9s %8s %10s %10s %10s  %s\n", "dataset", "type", "values", "bytes/val",
+           "ratio", "enc MB/s", "dec MB/s", "dec Mval/s", "encodings");
+    printf("%-18s %-7s %9s %9s %8s %10s %10s %10s  %s\n", "-------", "----", "------", "---------",
+           "-----", "--------", "--------", "----------", "---------");
 }
 
 /* Lists the encodings used, most frequent first, with their share of chunks. */
@@ -332,8 +333,7 @@ static void format_encodings(const bench_result* result, uint32_t chunks, char* 
     }
 }
 
-static void print_result(const char* name, const bench_column* column,
-                         const bench_result* result) {
+static void print_result(const char* name, const bench_column* column, const bench_result* result) {
     uint32_t chunks = (column->count + SX_VECTOR_SIZE - 1u) / SX_VECTOR_SIZE;
     double bytes_per_value = (double)result->encoded_bytes / column->count;
     double ratio = (double)result->raw_bytes / (double)result->encoded_bytes;

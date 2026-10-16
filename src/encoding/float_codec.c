@@ -69,11 +69,11 @@ static bool alp_encode_value(double value, int exponent, int factor, int64_t* di
 /* ALP_RD parameters                                                                        */
 /* ---------------------------------------------------------------------------------------- */
 
-#define RD_MAX_DICT         8u
-#define RD_MAX_CODE_WIDTH   3u
-#define RD_MIN_RIGHT_WIDTH  48u
-#define RD_MAX_RIGHT_WIDTH  63u
-#define RD_HEADER_SIZE      24u
+#define RD_MAX_DICT        8u
+#define RD_MAX_CODE_WIDTH  3u
+#define RD_MIN_RIGHT_WIDTH 48u
+#define RD_MAX_RIGHT_WIDTH 63u
+#define RD_HEADER_SIZE     24u
 
 /* Bits needed to store one ALP_RD exception: a u16 position and a u16 left part. */
 #define RD_EXCEPTION_BITS 32u
@@ -349,7 +349,8 @@ static void encode_alp_rd(const double* values, uint32_t count, uint32_t right_w
                           sx_byte_writer* out) {
     /* Low bits that are zero in every value are shifted out of the right parts. */
     uint32_t right_shift = common_trailing_zeros(values, count, right_width);
-    uint16_t left_parts[SX_VECTOR_SIZE];
+    /* Zeroed so that GCC can see build_rd_dictionary never reads uninitialized entries. */
+    uint16_t left_parts[SX_VECTOR_SIZE] = {0};
     uint64_t right_parts[SX_VECTOR_SIZE];
     for (uint32_t i = 0; i < count; i++) {
         uint64_t bits = sx_double_to_bits(values[i]);

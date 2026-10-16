@@ -17,8 +17,22 @@ int64_t sx_clock_realtime_ns(void) {
     return (int64_t)now.tv_sec * SX_NANOS_PER_SECOND + (int64_t)now.tv_nsec;
 }
 
-/* Splits a nanosecond timestamp into broken-down UTC time and the sub-second remainder. */
-static void split_utc(int64_t unix_ns, struct tm* fields, int64_t* nanos_of_second) {
+/*
+ * Calendar fields of a UTC time. Each field is reduced to its printable range, so the
+ * formatted text has a fixed length; nanosecond timestamps only span the years 1677 to
+ * 2262, so the reduction never changes a real value.
+ */
+typedef struct utc_fields {
+    unsigned year;
+    unsigned month;
+    unsigned day;
+    unsigned hour;
+    unsigned minute;
+    unsigned second;
+    unsigned millisecond;
+} utc_fields;
+
+static utc_fields split_utc(int64_t unix_ns) {
     int64_t seconds = unix_ns / SX_NANOS_PER_SECOND;
     int64_t remainder = unix_ns % SX_NANOS_PER_SECOND;
     if (remainder < 0) {
@@ -26,23 +40,30 @@ static void split_utc(int64_t unix_ns, struct tm* fields, int64_t* nanos_of_seco
         seconds -= 1;
     }
     time_t as_time = (time_t)seconds;
-    gmtime_r(&as_time, fields);
-    *nanos_of_second = remainder;
+    struct tm broken_down;
+    gmtime_r(&as_time, &broken_down);
+
+    utc_fields fields = {
+        .year = (unsigned)(broken_down.tm_year + 1900) % 10000u,
+        .month = (unsigned)(broken_down.tm_mon + 1) % 100u,
+        .day = (unsigned)broken_down.tm_mday % 100u,
+        .hour = (unsigned)broken_down.tm_hour % 100u,
+        .minute = (unsigned)broken_down.tm_min % 100u,
+        .second = (unsigned)broken_down.tm_sec % 100u,
+        .millisecond = (unsigned)(remainder / 1000000) % 1000u,
+    };
+    return fields;
 }
 
 void sx_format_utc_millis(int64_t unix_ns, char out[SX_TIMESTAMP_TEXT_SIZE]) {
-    struct tm fields;
-    int64_t nanos = 0;
-    split_utc(unix_ns, &fields, &nanos);
-    snprintf(out, SX_TIMESTAMP_TEXT_SIZE, "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
-             fields.tm_year + 1900, fields.tm_mon + 1, fields.tm_mday, fields.tm_hour,
-             fields.tm_min, fields.tm_sec, (int)(nanos / 1000000));
+    utc_fields fields = split_utc(unix_ns);
+    snprintf(out, SX_TIMESTAMP_TEXT_SIZE, "%04u-%02u-%02uT%02u:%02u:%02u.%03uZ", fields.year,
+             fields.month, fields.day, fields.hour, fields.minute, fields.second,
+             fields.millisecond);
 }
 
 void sx_format_utc_compact(int64_t unix_ns, char out[SX_TIMESTAMP_TEXT_SIZE]) {
-    struct tm fields;
-    int64_t nanos = 0;
-    split_utc(unix_ns, &fields, &nanos);
-    snprintf(out, SX_TIMESTAMP_TEXT_SIZE, "%04d%02d%02dT%02d%02d%02dZ", fields.tm_year + 1900,
-             fields.tm_mon + 1, fields.tm_mday, fields.tm_hour, fields.tm_min, fields.tm_sec);
+    utc_fields fields = split_utc(unix_ns);
+    snprintf(out, SX_TIMESTAMP_TEXT_SIZE, "%04u%02u%02uT%02u%02u%02uZ", fields.year, fields.month,
+             fields.day, fields.hour, fields.minute, fields.second);
 }

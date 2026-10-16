@@ -145,11 +145,10 @@ static void test_extreme_values_round_trip(void) {
     uint8_t buffer[SX_VECTOR_SIZE * sizeof(int64_t)];
     sx_byte_writer writer;
     sx_writer_init(&writer, buffer, sizeof(buffer));
-    SX_CHECK(sx_int64_encode_as(SX_ENCODING_DELTA_FOR, values, SX_VECTOR_SIZE, &writer) ==
-             SX_OK);
+    SX_CHECK(sx_int64_encode_as(SX_ENCODING_DELTA_FOR, values, SX_VECTOR_SIZE, &writer) == SX_OK);
     int64_t decoded[SX_VECTOR_SIZE];
-    SX_CHECK(sx_int64_decode(SX_ENCODING_DELTA_FOR, buffer, writer.size, SX_VECTOR_SIZE,
-                             decoded) == SX_OK);
+    SX_CHECK(sx_int64_decode(SX_ENCODING_DELTA_FOR, buffer, writer.size, SX_VECTOR_SIZE, decoded) ==
+             SX_OK);
     SX_CHECK_EQ_MEM(decoded, values, sizeof(values));
 }
 
@@ -209,8 +208,7 @@ static void test_corrupted_payloads_are_rejected(void) {
     buffer[16] = 65; /* width */
     SX_CHECK(sx_int64_decode(SX_ENCODING_FOR_BITPACK, buffer, writer.size, 100, decoded) ==
              SX_ERR_CORRUPT);
-    SX_CHECK(sx_int64_decode((sx_encoding)99, buffer, writer.size, 100, decoded) ==
-             SX_ERR_CORRUPT);
+    SX_CHECK(sx_int64_decode((sx_encoding)99, buffer, writer.size, 100, decoded) == SX_ERR_CORRUPT);
     SX_CHECK(sx_int64_decode(SX_ENCODING_RAW, buffer, 0, 0, decoded) == SX_ERR_INVALID_ARG);
 
     /* RLE whose run lengths do not add up to the count. */
@@ -219,10 +217,8 @@ static void test_corrupted_payloads_are_rejected(void) {
         values[i] = i / 10;
     }
     SX_CHECK(sx_int64_encode_as(SX_ENCODING_RLE, values, 100, &writer) == SX_OK);
-    SX_CHECK(sx_int64_decode(SX_ENCODING_RLE, buffer, writer.size, 101, decoded) ==
-             SX_ERR_CORRUPT);
-    SX_CHECK(sx_int64_decode(SX_ENCODING_RLE, buffer, writer.size, 99, decoded) ==
-             SX_ERR_CORRUPT);
+    SX_CHECK(sx_int64_decode(SX_ENCODING_RLE, buffer, writer.size, 101, decoded) == SX_ERR_CORRUPT);
+    SX_CHECK(sx_int64_decode(SX_ENCODING_RLE, buffer, writer.size, 99, decoded) == SX_ERR_CORRUPT);
 }
 
 static void test_random_payloads_never_crash(void) {

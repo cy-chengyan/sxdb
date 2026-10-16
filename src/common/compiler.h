@@ -32,13 +32,13 @@
 #define SX_LIKELY(x)   __builtin_expect(!!(x), 1)
 #define SX_UNLIKELY(x) __builtin_expect(!!(x), 0)
 
-#define SX_NOINLINE                     __attribute__((noinline))
-#define SX_NODISCARD                    __attribute__((warn_unused_result))
-#define SX_PRINTF_FORMAT(fmt, first)    __attribute__((format(printf, fmt, first)))
-#define SX_ALIGNED(bytes)               __attribute__((aligned(bytes)))
+#define SX_NOINLINE                  __attribute__((noinline))
+#define SX_NODISCARD                 __attribute__((warn_unused_result))
+#define SX_PRINTF_FORMAT(fmt, first) __attribute__((format(printf, fmt, first)))
+#define SX_ALIGNED(bytes)            __attribute__((aligned(bytes)))
 
-#define SX_UNUSED(x)      ((void)(x))
-#define SX_ARRAY_SIZE(a)  (sizeof(a) / sizeof((a)[0]))
+#define SX_UNUSED(x)     ((void)(x))
+#define SX_ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 
 /* Number of values in one execution vector and in one full storage block. */
 #define SX_VECTOR_SIZE 1024u

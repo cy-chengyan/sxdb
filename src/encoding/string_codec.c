@@ -172,8 +172,8 @@ static void encode_constant(const uint32_t* offsets, const uint8_t* data, sx_byt
     sx_writer_pad_to(out, 8);
 }
 
-static void encode_string(const uint32_t* offsets, const uint8_t* data,
-                          const string_stats* stats, sx_byte_writer* out) {
+static void encode_string(const uint32_t* offsets, const uint8_t* data, const string_stats* stats,
+                          sx_byte_writer* out) {
     sx_writer_put_u32(out, (uint32_t)stats->total_bytes);
     sx_writer_put_u32(out, stats->frame.base);
     sx_writer_put_u8(out, (uint8_t)stats->frame.width);
@@ -368,8 +368,7 @@ static bool parse_dict(sx_byte_reader* in, uint32_t count, parsed_strings* parse
     uint32_t dict_base = sx_reader_get_u32(in);
     uint32_t dict_width = sx_reader_get_u8(in);
     sx_reader_take(in, 3);
-    if (dict_count == 0 || dict_count > count ||
-        code_width != sx_bit_width_u64(dict_count - 1u)) {
+    if (dict_count == 0 || dict_count > count || code_width != sx_bit_width_u64(dict_count - 1u)) {
         return false;
     }
 
@@ -380,8 +379,7 @@ static bool parse_dict(sx_byte_reader* in, uint32_t count, parsed_strings* parse
     }
     const uint8_t* bytes = sx_reader_take(in, dict_total);
     sx_reader_skip_to(in, 8);
-    if (bytes == NULL ||
-        !split_bytes(bytes, dict_total, dict_lengths, dict_count, dict_sources)) {
+    if (bytes == NULL || !split_bytes(bytes, dict_total, dict_lengths, dict_count, dict_sources)) {
         return false;
     }
 
@@ -442,8 +440,8 @@ sx_err sx_string_decoded_size(sx_encoding encoding, const uint8_t* payload, size
     return err;
 }
 
-sx_err sx_string_decode(sx_encoding encoding, const uint8_t* payload, size_t size,
-                        uint32_t count, uint32_t* offsets, uint8_t* data, size_t data_capacity) {
+sx_err sx_string_decode(sx_encoding encoding, const uint8_t* payload, size_t size, uint32_t count,
+                        uint32_t* offsets, uint8_t* data, size_t data_capacity) {
     parsed_strings parsed;
     sx_err err = parse_payload(encoding, payload, size, count, &parsed);
     if (err != SX_OK) {

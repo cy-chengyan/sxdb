@@ -21,8 +21,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Source rules (ASCII, banned functions, SPDX, layering)
         run: scripts/check-source.sh
-      - name: Install clang-format
-        run: sudo apt-get update && sudo apt-get install -y clang-format
+      # Pinned: different clang-format releases format the same code differently.
+      - name: Install clang-format 22.1.8
+        run: pipx install clang-format==22.1.8
       - name: Formatting
         run: |
           find src include tests tools -name '*.[ch]' -print0 \

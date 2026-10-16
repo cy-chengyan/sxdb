@@ -61,8 +61,8 @@ static bool gen_ts_jitter(bench_column* column, uint64_t seed) {
     sx_rng_seed(&rng, seed);
     for (uint32_t i = 0; i < column->count; i++) {
         int64_t jitter_us = (int64_t)sx_rng_below(&rng, 101) - 50;
-        column->ints[i] = START_TIME_NS + (int64_t)i * 10 * NANOS_PER_MILLI +
-                          jitter_us * NANOS_PER_MICRO;
+        column->ints[i] =
+            START_TIME_NS + (int64_t)i * 10 * NANOS_PER_MILLI + jitter_us * NANOS_PER_MICRO;
     }
     return true;
 }
@@ -275,8 +275,7 @@ const bench_dataset bench_datasets[] = {
     {"temperature_2dp", "sensor temperature, 2 decimals", BENCH_TYPE_DOUBLE, gen_temperature},
     {"float32_sensor", "float32 readings widened", BENCH_TYPE_DOUBLE, gen_float_sensor},
     {"moving_average", "full-precision computed values", BENCH_TYPE_DOUBLE, gen_moving_average},
-    {"random_double", "uniform random in [0,1) (worst case)", BENCH_TYPE_DOUBLE,
-     gen_random_double},
+    {"random_double", "uniform random in [0,1) (worst case)", BENCH_TYPE_DOUBLE, gen_random_double},
     {"rare_flags", "boolean, 1% true", BENCH_TYPE_BOOL, gen_rare_flags},
     {"trade_side", "\"B\" or \"S\"", BENCH_TYPE_STRING, gen_trade_side},
     {"instrument_codes", "300 distinct tickers", BENCH_TYPE_STRING, gen_instrument_codes},

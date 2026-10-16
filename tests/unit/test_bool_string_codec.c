@@ -111,8 +111,7 @@ static bool string_round_trip(const string_column* column, sx_encoding* encoding
     static uint8_t data[SX_VECTOR_SIZE * 64];
     if (sx_string_decode(*encoding, buffer, writer.size, column->count, offsets, data,
                          sizeof(data)) != SX_OK) {
-        sx_test_fail(__FILE__, __LINE__, "string decode of %s failed",
-                     sx_encoding_name(*encoding));
+        sx_test_fail(__FILE__, __LINE__, "string decode of %s failed", sx_encoding_name(*encoding));
         return false;
     }
     if (memcmp(offsets, column->offsets, (column->count + 1u) * sizeof(uint32_t)) != 0 ||

@@ -78,8 +78,13 @@ static void test_one_decimal_percentages_use_alp(void) {
 
 static void test_special_values_round_trip(void) {
     const double specials[] = {
-        NAN, -NAN, INFINITY, -INFINITY, -0.0, 0.0, DBL_MIN, DBL_MAX, -DBL_MAX,
-        4.9406564584124654e-324, 1e300, -1e-300, 0.1, 123456789012345678.0,
+        NAN,      -NAN,
+        INFINITY, -INFINITY,
+        -0.0,     0.0,
+        DBL_MIN,  DBL_MAX,
+        -DBL_MAX, 4.9406564584124654e-324,
+        1e300,    -1e-300,
+        0.1,      123456789012345678.0,
     };
     double values[SX_VECTOR_SIZE];
     fill_price_walk(values, SX_VECTOR_SIZE, 3);
@@ -193,7 +198,10 @@ static void test_corrupted_payloads_are_rejected(void) {
 
 static void test_random_payloads_never_crash(void) {
     static const sx_encoding encodings[] = {
-        SX_ENCODING_RAW, SX_ENCODING_CONSTANT, SX_ENCODING_ALP, SX_ENCODING_ALP_RD,
+        SX_ENCODING_RAW,
+        SX_ENCODING_CONSTANT,
+        SX_ENCODING_ALP,
+        SX_ENCODING_ALP_RD,
     };
     sx_rng rng;
     sx_rng_seed(&rng, 8);

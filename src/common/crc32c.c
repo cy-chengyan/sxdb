@@ -68,9 +68,8 @@ static uint32_t crc32c_software_raw(uint32_t crc, const uint8_t* data, size_t si
 
 #if defined(SX_ARCH_X86_64)
 
-__attribute__((target("sse4.2"))) static uint32_t crc32c_hardware_raw(uint32_t crc,
-                                                                       const uint8_t* data,
-                                                                       size_t size) {
+__attribute__((target("sse4.2"))) static uint32_t
+crc32c_hardware_raw(uint32_t crc, const uint8_t* data, size_t size) {
     uint64_t crc64 = crc;
     while (size >= 8) {
         crc64 = _mm_crc32_u64(crc64, sx_load_u64(data));
@@ -97,8 +96,7 @@ __attribute__((target("sse4.2"))) static uint32_t crc32c_hardware_raw(uint32_t c
 #define SX_TARGET_CRC __attribute__((target("+crc")))
 #endif
 
-SX_TARGET_CRC static uint32_t crc32c_hardware_raw(uint32_t crc, const uint8_t* data,
-                                                  size_t size) {
+SX_TARGET_CRC static uint32_t crc32c_hardware_raw(uint32_t crc, const uint8_t* data, size_t size) {
     while (size >= 8) {
         crc = __crc32cd(crc, sx_load_u64(data));
         data += 8;

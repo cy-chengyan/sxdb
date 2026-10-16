@@ -34,7 +34,7 @@ Useful options:
 | `-DSXDB_SANITIZE=thread` | Build with ThreadSanitizer |
 | `-DSXDB_WERROR=ON` | Treat compiler warnings as errors (always on in CI) |
 
-`scripts/check-source.sh` checks the source rules (ASCII only, banned functions, license headers, layering). Formatting follows `.clang-format`.
+`scripts/check-source.sh` checks the source rules (ASCII only, banned functions, license headers, layering). Formatting follows `.clang-format` and is checked in CI with clang-format 22.1.8; other releases format some constructs differently, so use the same version (`pipx install clang-format==22.1.8`).
 
 ## Encoding Benchmark
 

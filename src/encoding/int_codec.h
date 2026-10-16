@@ -8,13 +8,19 @@
  *
  *   RAW          i64 values[count]
  *   CONSTANT     i64 value
- *   DELTA_CONST  i64 first | i64 step                      value[i] = first + i * step
+ *   DELTA_CONST  i64 first | i64 step
  *   RLE          u16 run_count | pad[6] | i64 run_values[run_count]
  *                | u16 run_lengths[run_count] | pad to 8
- *   FOR_BITPACK  i64 base | u64 multiplier | u8 width | pad[7]
- *                | packed[count]                           value[i] = base + packed[i] * multiplier
+ *   FOR_BITPACK  i64 base | u64 multiplier | u8 width | pad[7] | packed[count]
  *   DELTA_FOR    i64 first | i64 delta_base | u64 multiplier | u8 width | pad[7]
- *                | packed[count - 1]                       delta[i] = delta_base + packed[i] * multiplier
+ *                | packed[count - 1]
+ *
+ * Decoding:
+ *
+ *   DELTA_CONST  value[i] = first + i * step
+ *   FOR_BITPACK  value[i] = base + packed[i] * multiplier
+ *   DELTA_FOR    value[0] = first
+ *                value[i] = value[i - 1] + delta_base + packed[i - 1] * multiplier
  *
  * The multiplier is the greatest common divisor of the offsets, so data whose values or
  * steps share a factor (millisecond timestamps stored as nanoseconds, prices that are

@@ -25,8 +25,12 @@ extern const sx_test_suite sx_test_suite_float_codec;
 extern const sx_test_suite sx_test_suite_bool_string_codec;
 
 static const sx_test_suite* const all_suites[] = {
-    &sx_test_suite_common,    &sx_test_suite_log,         &sx_test_suite_mem,
-    &sx_test_suite_bitpack,   &sx_test_suite_int_codec,   &sx_test_suite_float_codec,
+    &sx_test_suite_common,
+    &sx_test_suite_log,
+    &sx_test_suite_mem,
+    &sx_test_suite_bitpack,
+    &sx_test_suite_int_codec,
+    &sx_test_suite_float_codec,
     &sx_test_suite_bool_string_codec,
 };
 

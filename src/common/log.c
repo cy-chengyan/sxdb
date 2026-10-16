@@ -172,8 +172,8 @@ static size_t escape_message(char* dst, size_t capacity, const char* message) {
 }
 
 SX_PRINTF_FORMAT(4, 0)
-static void format_line(log_line* line, sx_log_level level, const char* module,
-                        const char* format, va_list args) {
+static void format_line(log_line* line, sx_log_level level, const char* module, const char* format,
+                        va_list args) {
     char timestamp[SX_TIMESTAMP_TEXT_SIZE];
     sx_format_utc_millis(sx_clock_realtime_ns(), timestamp);
 
@@ -461,8 +461,8 @@ static bool is_valid_name(const char* name) {
     }
     for (size_t i = 0; i < length; i++) {
         char c = name[i];
-        bool allowed = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                       (c >= '0' && c <= '9') || c == '_';
+        bool allowed =
+            (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
         if (!allowed) {
             return false;
         }

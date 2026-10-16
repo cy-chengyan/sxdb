@@ -97,8 +97,7 @@ static void compute_stats(const int64_t* values, uint32_t count, int_stats* stat
             sx_gcd_u64(stats->delta_multiplier, offset_from(delta, stats->delta_min));
     }
 
-    stats->for_width =
-        packed_width(offset_from(stats->max, stats->min), stats->for_multiplier);
+    stats->for_width = packed_width(offset_from(stats->max, stats->min), stats->for_multiplier);
     stats->delta_width =
         packed_width(offset_from(delta_max, stats->delta_min), stats->delta_multiplier);
 }
@@ -159,8 +158,7 @@ static void encode_for(const int64_t* values, const int_stats* stats, sx_byte_wr
                          stats->for_width);
 }
 
-static void encode_delta_for(const int64_t* values, const int_stats* stats,
-                             sx_byte_writer* out) {
+static void encode_delta_for(const int64_t* values, const int_stats* stats, sx_byte_writer* out) {
     int64_t deltas[SX_VECTOR_SIZE];
     for (uint32_t i = 1; i < stats->count; i++) {
         deltas[i - 1] = wrapping_delta(values[i], values[i - 1]);
@@ -170,8 +168,8 @@ static void encode_delta_for(const int64_t* values, const int_stats* stats,
     sx_writer_put_u64(out, stats->delta_multiplier);
     sx_writer_put_u8(out, (uint8_t)stats->delta_width);
     write_padding(out, HEADER_PADDING);
-    write_packed_offsets(out, deltas, stats->count - 1, stats->delta_min,
-                         stats->delta_multiplier, stats->delta_width);
+    write_packed_offsets(out, deltas, stats->count - 1, stats->delta_min, stats->delta_multiplier,
+                         stats->delta_width);
 }
 
 static void encode_rle(const int64_t* values, uint32_t count, sx_byte_writer* out) {
@@ -246,8 +244,8 @@ sx_err sx_int64_encode(const int64_t* values, uint32_t count, sx_byte_writer* ou
 
     /* Candidates in order of decoding speed; a later one must be strictly smaller. */
     static const sx_encoding candidates[] = {
-        SX_ENCODING_CONSTANT, SX_ENCODING_DELTA_CONST, SX_ENCODING_FOR_BITPACK,
-        SX_ENCODING_DELTA_FOR, SX_ENCODING_RLE, SX_ENCODING_RAW,
+        SX_ENCODING_CONSTANT,  SX_ENCODING_DELTA_CONST, SX_ENCODING_FOR_BITPACK,
+        SX_ENCODING_DELTA_FOR, SX_ENCODING_RLE,         SX_ENCODING_RAW,
     };
     sx_encoding best = SX_ENCODING_RAW;
     size_t best_size = SIZE_MAX;

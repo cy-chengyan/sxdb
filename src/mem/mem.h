@@ -24,12 +24,12 @@
 #include <stdint.h>
 
 typedef enum sx_mem_pool {
-    SX_MEM_POOL_BUFFER = 0,  /* buffer pool (block cache); evictable */
-    SX_MEM_POOL_MEMTABLE,    /* write buffers; released by flushing */
-    SX_MEM_POOL_QUERY,       /* query working memory */
-    SX_MEM_POOL_INDEX,       /* series index structures */
-    SX_MEM_POOL_CONNECTION,  /* network connection buffers */
-    SX_MEM_POOL_OTHER,       /* everything else that is tracked */
+    SX_MEM_POOL_BUFFER = 0, /* buffer pool (block cache); evictable */
+    SX_MEM_POOL_MEMTABLE,   /* write buffers; released by flushing */
+    SX_MEM_POOL_QUERY,      /* query working memory */
+    SX_MEM_POOL_INDEX,      /* series index structures */
+    SX_MEM_POOL_CONNECTION, /* network connection buffers */
+    SX_MEM_POOL_OTHER,      /* everything else that is tracked */
     SX_MEM_POOL_COUNT,
 } sx_mem_pool;
 

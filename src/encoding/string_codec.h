@@ -49,7 +49,7 @@ sx_err sx_string_decoded_size(sx_encoding encoding, const uint8_t* payload, size
  * Decodes into `offsets` (count + 1 entries) and `data` (`data_capacity` bytes, at least
  * the size reported by sx_string_decoded_size).
  */
-sx_err sx_string_decode(sx_encoding encoding, const uint8_t* payload, size_t size,
-                        uint32_t count, uint32_t* offsets, uint8_t* data, size_t data_capacity);
+sx_err sx_string_decode(sx_encoding encoding, const uint8_t* payload, size_t size, uint32_t count,
+                        uint32_t* offsets, uint8_t* data, size_t data_capacity);
 
 #endif /* SX_ENCODING_STRING_CODEC_H */

@@ -25,8 +25,8 @@ typedef struct bench_column {
     int64_t* ints;
     double* doubles;
     uint8_t* bools;
-    uint32_t* offsets;     /* count + 1 entries */
-    uint8_t* string_data;  /* string bytes */
+    uint32_t* offsets;    /* count + 1 entries */
+    uint8_t* string_data; /* string bytes */
     size_t string_capacity;
 } bench_column;
 
@@ -35,8 +35,7 @@ bool bench_column_init(bench_column* column, bench_type type, uint32_t count,
                        size_t string_capacity);
 
 /* Appends one string, growing the byte buffer as needed. Used while generating. */
-bool bench_column_set_string(bench_column* column, uint32_t index, const char* text,
-                             size_t length);
+bool bench_column_set_string(bench_column* column, uint32_t index, const char* text, size_t length);
 
 void bench_column_free(bench_column* column);
 
