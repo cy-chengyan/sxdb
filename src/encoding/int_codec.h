@@ -14,13 +14,25 @@
  *   FOR_BITPACK  i64 base | u64 multiplier | u8 width | pad[7] | packed[count]
  *   DELTA_FOR    i64 first | i64 delta_base | u64 multiplier | u8 width | pad[7]
  *                | packed[count - 1]
+ *   DELTA_PATCHED
+ *                i64 first | i64 delta_base | u64 multiplier | u8 width | pad[1]
+ *                | u16 exception_count | pad[4] | packed[count - 1]
+ *                | u16 exception_positions[k] | pad to 8 | u64 exception_offsets[k]
  *
  * Decoding:
  *
  *   DELTA_CONST  value[i] = first + i * step
  *   FOR_BITPACK  value[i] = base + packed[i] * multiplier
  *   DELTA_FOR    value[0] = first
- *                value[i] = value[i - 1] + delta_base + packed[i - 1] * multiplier
+ *                value[i] = value[i - 1] + delta_base + offset[i - 1] * multiplier
+ *                with offset = packed
+ *   DELTA_PATCHED
+ *                as DELTA_FOR, except that offset[exception_positions[j]] is
+ *                exception_offsets[j] (its packed slot holds 0)
+ *
+ * DELTA_PATCHED serves timestamps with a few large gaps, such as trading sessions with
+ * a lunch break or overnight gaps: the regular steps are packed narrowly and the few
+ * large ones are stored apart instead of widening every value.
  *
  * The multiplier is the greatest common divisor of the offsets, so data whose values or
  * steps share a factor (millisecond timestamps stored as nanoseconds, prices that are

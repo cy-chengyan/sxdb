@@ -26,6 +26,8 @@ const char* sx_encoding_name(sx_encoding encoding) {
             return "STRING";
         case SX_ENCODING_BITMAP:
             return "BITMAP";
+        case SX_ENCODING_DELTA_PATCHED:
+            return "DELTA_PATCHED";
     }
     return "UNKNOWN";
 }

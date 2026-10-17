@@ -41,7 +41,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define ENCODING_ID_COUNT   11u
+#define ENCODING_ID_COUNT   SX_ENCODING_ID_COUNT
 #define DEFAULT_VALUE_COUNT (1u << 20)
 #define DEFAULT_MIN_SECONDS 0.25
 #define MAX_THREADS         256u
@@ -115,13 +115,19 @@ static size_t chunk_bound(const bench_column* column, uint32_t start, uint32_t c
     return 0;
 }
 
+/*
+ * Encodes one chunk. `double_encoder` carries ALP parameter choices from one chunk to the
+ * next, as when the storage engine encodes the chunks of a column in order.
+ */
 static sx_err encode_chunk(const bench_column* column, uint32_t start, uint32_t count,
-                           sx_byte_writer* writer, sx_encoding* encoding) {
+                           sx_double_encoder* double_encoder, sx_byte_writer* writer,
+                           sx_encoding* encoding) {
     switch (column->type) {
         case BENCH_TYPE_INT64:
             return sx_int64_encode(column->ints + start, count, writer, encoding);
         case BENCH_TYPE_DOUBLE:
-            return sx_double_encode(column->doubles + start, count, writer, encoding);
+            return sx_double_encoder_encode(double_encoder, column->doubles + start, count, writer,
+                                            encoding);
         case BENCH_TYPE_BOOL:
             return sx_bool_encode(column->bools + start, count, writer, encoding);
         case BENCH_TYPE_STRING:
@@ -184,14 +190,16 @@ static bool chunk_matches(const bench_column* column, uint32_t start, uint32_t c
 /* ---------------------------------------------------------------------------------------- */
 
 static bool encode_range(bench_job* job, uint32_t first, uint32_t end) {
+    sx_double_encoder double_encoder;
+    sx_double_encoder_init(&double_encoder);
     for (uint32_t chunk = first; chunk < end; chunk++) {
         uint32_t start = job->chunks->starts[chunk];
         uint32_t count = job->chunks->counts[chunk];
         sx_byte_writer writer;
         sx_writer_init(&writer, job->encoded.data + job->encoded.slot_offsets[chunk],
                        chunk_bound(job->column, start, count));
-        if (encode_chunk(job->column, start, count, &writer, &job->encoded.encodings[chunk]) !=
-            SX_OK) {
+        if (encode_chunk(job->column, start, count, &double_encoder, &writer,
+                         &job->encoded.encodings[chunk]) != SX_OK) {
             fprintf(stderr, "error: encoding chunk %u failed\n", chunk);
             return false;
         }

@@ -221,6 +221,106 @@ static void test_corrupted_payloads_are_rejected(void) {
     SX_CHECK(sx_int64_decode(SX_ENCODING_RLE, buffer, writer.size, 99, decoded) == SX_ERR_CORRUPT);
 }
 
+#define NANOS_PER_MINUTE (INT64_C(60) * INT64_C(1000000000))
+
+/* Appends the 241 minute bars of one trading day: 09:30 to 11:30 and 13:01 to 15:00. */
+static uint32_t append_trading_day(int64_t* values, uint32_t count, int64_t day_start_ns) {
+    for (int64_t minute = 9 * 60 + 30; minute <= 11 * 60 + 30; minute++) {
+        values[count++] = day_start_ns + minute * NANOS_PER_MINUTE;
+    }
+    for (int64_t minute = 13 * 60 + 1; minute <= 15 * 60; minute++) {
+        values[count++] = day_start_ns + minute * NANOS_PER_MINUTE;
+    }
+    return count;
+}
+
+static void test_trading_session_timestamps_use_delta_patched(void) {
+    int64_t values[SX_VECTOR_SIZE + 256];
+    uint32_t count = append_trading_day(values, 0, BASE_TIME_NS);
+    SX_CHECK_EQ_U64(count, 241);
+    encoded_chunk chunk;
+    SX_CHECK(round_trip(values, count, &chunk));
+    SX_CHECK(chunk.encoding == SX_ENCODING_DELTA_PATCHED);
+    /* Header, no packed bits for the regular steps, one exception for the lunch break. */
+    SX_CHECK(chunk.size <= 32 + 8 + 8);
+
+    /* Several days in one chunk: lunch breaks, nights, and a weekend are exceptions. */
+    count = 0;
+    static const int day_offsets[] = {0, 1, 2, 3, 6};
+    for (size_t d = 0; d < SX_ARRAY_SIZE(day_offsets); d++) {
+        count = append_trading_day(values, count,
+                                   BASE_TIME_NS + day_offsets[d] * 1440 * 60 * INT64_C(1000000000));
+    }
+    SX_CHECK(round_trip(values, SX_VECTOR_SIZE, &chunk));
+    SX_CHECK(chunk.encoding == SX_ENCODING_DELTA_PATCHED);
+    SX_CHECK(chunk.size < 200);
+}
+
+static void test_patched_extreme_jumps_round_trip(void) {
+    int64_t values[SX_VECTOR_SIZE];
+    for (uint32_t i = 0; i < SX_VECTOR_SIZE; i++) {
+        if (i < 300) {
+            values[i] = (int64_t)i;
+        } else if (i < 700) {
+            values[i] = INT64_MAX - 1000 + (int64_t)i;
+        } else {
+            values[i] = INT64_MIN + (int64_t)i;
+        }
+    }
+    encoded_chunk chunk;
+    SX_CHECK(round_trip(values, SX_VECTOR_SIZE, &chunk));
+    SX_CHECK(chunk.encoding == SX_ENCODING_DELTA_PATCHED);
+
+    uint8_t buffer[SX_VECTOR_SIZE * 16];
+    sx_byte_writer writer;
+    sx_writer_init(&writer, buffer, sizeof(buffer));
+    SX_CHECK(sx_int64_encode_as(SX_ENCODING_DELTA_PATCHED, values, 2, &writer) ==
+             SX_ERR_UNSUPPORTED);
+}
+
+static void test_common_multipliers_round_trip(void) {
+    static const uint64_t multipliers[] = {
+        1, 2, 3, 7, 100, 1000000, UINT64_C(60000000000), UINT64_C(1) << 40, UINT64_C(999999999989),
+    };
+    int64_t values[SX_VECTOR_SIZE];
+    sx_rng rng;
+    sx_rng_seed(&rng, 7);
+    for (size_t m = 0; m < SX_ARRAY_SIZE(multipliers); m++) {
+        for (uint32_t i = 0; i < SX_VECTOR_SIZE; i++) {
+            values[i] = INT64_C(-5000000) + (int64_t)(sx_rng_below(&rng, 1000) * multipliers[m]);
+        }
+        encoded_chunk chunk;
+        SX_CHECK(round_trip(values, SX_VECTOR_SIZE, &chunk));
+        SX_CHECK(chunk.encoding == SX_ENCODING_FOR_BITPACK);
+        /* Offsets below 1000 need 10 bits once the multiplier is divided out. */
+        SX_CHECK(chunk.size <= 24 + 10 * 128);
+    }
+}
+
+static void test_patched_corruption_is_rejected(void) {
+    int64_t values[256];
+    uint32_t count = append_trading_day(values, 0, BASE_TIME_NS);
+    uint8_t buffer[1024];
+    sx_byte_writer writer;
+    sx_writer_init(&writer, buffer, sizeof(buffer));
+    SX_CHECK(sx_int64_encode_as(SX_ENCODING_DELTA_PATCHED, values, count, &writer) == SX_OK);
+    int64_t decoded[SX_VECTOR_SIZE];
+    SX_CHECK(sx_int64_decode(SX_ENCODING_DELTA_PATCHED, buffer, writer.size, count, decoded) ==
+             SX_OK);
+    SX_CHECK(sx_int64_decode(SX_ENCODING_DELTA_PATCHED, buffer, writer.size - 1, count, decoded) ==
+             SX_ERR_CORRUPT);
+
+    /* The packed width is 0, so the exception list starts right after the 32-byte header. */
+    uint8_t saved = buffer[33];
+    buffer[33] = 0xFF; /* exception position far beyond the deltas */
+    SX_CHECK(sx_int64_decode(SX_ENCODING_DELTA_PATCHED, buffer, writer.size, count, decoded) ==
+             SX_ERR_CORRUPT);
+    buffer[33] = saved;
+    buffer[27] = 0x7F; /* exception count above the number of deltas */
+    SX_CHECK(sx_int64_decode(SX_ENCODING_DELTA_PATCHED, buffer, writer.size, count, decoded) ==
+             SX_ERR_CORRUPT);
+}
+
 static void test_random_payloads_never_crash(void) {
     sx_rng rng;
     sx_rng_seed(&rng, 6);
@@ -231,7 +331,7 @@ static void test_random_payloads_never_crash(void) {
         for (size_t i = 0; i < size; i++) {
             payload[i] = (uint8_t)sx_rng_next(&rng);
         }
-        sx_encoding encoding = (sx_encoding)sx_rng_below(&rng, 11);
+        sx_encoding encoding = (sx_encoding)sx_rng_below(&rng, SX_ENCODING_ID_COUNT);
         uint32_t count = 1 + (uint32_t)sx_rng_below(&rng, SX_VECTOR_SIZE);
         sx_err err = sx_int64_decode(encoding, payload, size, count, decoded);
         SX_CHECK(err == SX_OK || err == SX_ERR_CORRUPT);
@@ -248,6 +348,10 @@ static const sx_test_case cases[] = {
     {"extreme_values", test_extreme_values_round_trip},
     {"forced_encodings", test_forced_encodings_round_trip},
     {"corrupted_payloads", test_corrupted_payloads_are_rejected},
+    {"trading_session_timestamps", test_trading_session_timestamps_use_delta_patched},
+    {"patched_extreme_jumps", test_patched_extreme_jumps_round_trip},
+    {"common_multipliers", test_common_multipliers_round_trip},
+    {"patched_corruption", test_patched_corruption_is_rejected},
     {"random_payloads", test_random_payloads_never_crash},
 };
 

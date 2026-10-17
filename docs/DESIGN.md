@@ -2,12 +2,12 @@
 
 | Item | Value |
 |---|---|
-| Document version | 1.0 (baseline) |
-| Status | Baseline design; development has not started |
-| Date | 2026-10-16 |
+| Document version | 1.1 |
+| Status | Milestone M0 (foundation and encodings) in progress |
+| Date | 2026-10-17 |
 | License | GPL-2.0-or-later (the Python client is MIT) |
 
-This document is the baseline design of sxdb. Open items are listed in §18.
+This document is the design of sxdb; version 1.0 was the baseline, and later changes are tracked in version control. Open items are listed in §18.
 
 ---
 
@@ -206,11 +206,13 @@ All encodings are lightweight and SIMD-decodable. Following the performance-firs
 | 8 | DICT | Table-level dictionary ids for SYMBOL; per-block dictionary for VARCHAR |
 | 9 | STRING | Offsets + bytes, optionally LZ4 |
 | 10 | BITMAP | BOOL |
+| 11 | DELTA_PATCHED | Timestamps with a few large gaps (lunch breaks, nights, weekends) and other mostly regular sequences: regular steps are packed narrowly and the few large ones are stored apart as exceptions |
 
-- When writing a chunk, a sample is tried against the applicable encodings and the smallest result wins.
+- When writing a chunk, the applicable encodings are compared and the smallest result wins. Integer encodings are sized exactly from one pass of statistics; floating-point encodings are estimated from a sample.
+- ALP parameter choice is carried across the chunks of a column: the encoder remembers the best exponent/factor pairs, repeats the full search every 64 chunks or when the remembered pairs start producing exceptions, and always also tries fewer decimal places. This keeps encoding fast on small chunks without losing compression.
 - Bit-packing uses a FastLanes-style interleaved layout of 1024 values, so even scalar code auto-vectorizes.
 - Cold partitions can add a ZSTD layer, enabled with the table option `cold_compression = 'zstd'` (off by default).
-- The exact byte layout of each encoding's parameters and payload is finalized in M0 after benchmarking with real data.
+- The byte layout of each encoding's payload is documented in its codec header (`src/encoding/*_codec.h`).
 
 ### 4.3 Block Formation
 1. The output of a flush or compaction is first sorted by `(series_id, ts)`.

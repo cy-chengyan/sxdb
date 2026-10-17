@@ -30,7 +30,11 @@ typedef enum sx_encoding {
     SX_ENCODING_DICT = 8,
     SX_ENCODING_STRING = 9,
     SX_ENCODING_BITMAP = 10,
+    SX_ENCODING_DELTA_PATCHED = 11,
 } sx_encoding;
+
+/* One more than the largest encoding id, for tables indexed by id. */
+#define SX_ENCODING_ID_COUNT 12u
 
 const char* sx_encoding_name(sx_encoding encoding);
 

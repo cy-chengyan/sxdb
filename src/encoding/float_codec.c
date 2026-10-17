@@ -12,6 +12,13 @@
 /* Number of values examined when choosing encoding parameters. */
 #define SAMPLE_SIZE 32u
 
+/* A full parameter search is repeated at least this often (in chunks)... */
+#define ALP_SEARCH_INTERVAL 64u
+
+/* ...and immediately when the remembered parameters produce this many more sample
+ * exceptions than the last full search found. */
+#define ALP_CHANGE_EXCEPTIONS (SAMPLE_SIZE / 8u)
+
 /* ---------------------------------------------------------------------------------------- */
 /* ALP parameters                                                                           */
 /* ---------------------------------------------------------------------------------------- */
@@ -110,40 +117,105 @@ static uint64_t scale_to_chunk(uint32_t sample_count, uint32_t sample_size, uint
 typedef struct alp_choice {
     int exponent;
     int factor;
+    uint32_t sample_exceptions;
     uint64_t estimated_bits;
 } alp_choice;
 
-/* Tries every exponent/factor pair on the sample and keeps the cheapest. */
-static alp_choice choose_alp_parameters(const sample* sampled, uint32_t count) {
-    alp_choice best = {.exponent = 0, .factor = 0, .estimated_bits = UINT64_MAX};
+/* Estimates the encoded size of the chunk for one exponent/factor pair. */
+static alp_choice estimate_alp(const sample* sampled, uint32_t count, int exponent, int factor) {
+    uint32_t exceptions = 0;
+    bool any_encoded = false;
+    int64_t min_digits = 0;
+    int64_t max_digits = 0;
+    for (uint32_t i = 0; i < sampled->size; i++) {
+        int64_t digits = 0;
+        if (!alp_encode_value(sampled->values[i], exponent, factor, &digits)) {
+            exceptions++;
+        } else if (!any_encoded) {
+            min_digits = digits;
+            max_digits = digits;
+            any_encoded = true;
+        } else if (digits < min_digits) {
+            min_digits = digits;
+        } else if (digits > max_digits) {
+            max_digits = digits;
+        }
+    }
+    uint32_t width = sx_bit_width_u64((uint64_t)max_digits - (uint64_t)min_digits);
+    alp_choice choice = {
+        .exponent = exponent,
+        .factor = factor,
+        .sample_exceptions = exceptions,
+        .estimated_bits = (uint64_t)count * width +
+                          scale_to_chunk(exceptions, sampled->size, count) * ALP_EXCEPTION_BITS,
+    };
+    return choice;
+}
+
+/* Inserts `choice` into a list of the best choices, kept in ascending order of size. */
+static void keep_best(alp_choice* best, uint32_t* best_count, alp_choice choice) {
+    uint32_t slot = *best_count;
+    if (*best_count == SX_ALP_CANDIDATES) {
+        slot = SX_ALP_CANDIDATES - 1u;
+        if (choice.estimated_bits >= best[slot].estimated_bits) {
+            return;
+        }
+    } else {
+        (*best_count)++;
+    }
+    while (slot > 0 && best[slot - 1].estimated_bits > choice.estimated_bits) {
+        best[slot] = best[slot - 1];
+        slot--;
+    }
+    best[slot] = choice;
+}
+
+/*
+ * Tries every exponent/factor pair on the sample and returns the cheapest. If `encoder`
+ * is given, the best few pairs are remembered for the following chunks.
+ */
+static alp_choice search_alp(const sample* sampled, uint32_t count, sx_double_encoder* encoder) {
+    alp_choice best[SX_ALP_CANDIDATES];
+    uint32_t best_count = 0;
     for (int exponent = 0; exponent <= ALP_MAX_EXPONENT; exponent++) {
         for (int factor = 0; factor <= exponent; factor++) {
-            uint32_t exceptions = 0;
-            bool any_encoded = false;
-            int64_t min_digits = 0;
-            int64_t max_digits = 0;
-            for (uint32_t i = 0; i < sampled->size; i++) {
-                int64_t digits = 0;
-                if (!alp_encode_value(sampled->values[i], exponent, factor, &digits)) {
-                    exceptions++;
-                } else if (!any_encoded) {
-                    min_digits = digits;
-                    max_digits = digits;
-                    any_encoded = true;
-                } else if (digits < min_digits) {
-                    min_digits = digits;
-                } else if (digits > max_digits) {
-                    max_digits = digits;
-                }
-            }
-            uint32_t width = sx_bit_width_u64((uint64_t)max_digits - (uint64_t)min_digits);
-            uint64_t bits = (uint64_t)count * width +
-                            scale_to_chunk(exceptions, sampled->size, count) * ALP_EXCEPTION_BITS;
-            if (bits < best.estimated_bits) {
-                best.exponent = exponent;
-                best.factor = factor;
-                best.estimated_bits = bits;
-            }
+            keep_best(best, &best_count, estimate_alp(sampled, count, exponent, factor));
+        }
+    }
+    if (encoder != NULL) {
+        for (uint32_t i = 0; i < best_count; i++) {
+            encoder->exponents[i] = (uint8_t)best[i].exponent;
+            encoder->factors[i] = (uint8_t)best[i].factor;
+        }
+        encoder->candidate_count = best_count;
+        encoder->search_exceptions = best[0].sample_exceptions;
+    }
+    return best[0];
+}
+
+/*
+ * Tries the pairs the encoder remembers and returns the cheapest.
+ *
+ * A pair effectively scales values by 10^(exponent - factor), that is, keeps that many
+ * decimal places. A chunk that needs fewer places than the remembered pairs still encodes
+ * without exceptions, just with needlessly large integers, which the exception check
+ * cannot notice. So every smaller number of places is tried as well (a few extra pairs).
+ */
+static alp_choice best_remembered_alp(const sx_double_encoder* encoder, const sample* sampled,
+                                      uint32_t count) {
+    alp_choice best = estimate_alp(sampled, count, encoder->exponents[0], encoder->factors[0]);
+    for (uint32_t i = 1; i < encoder->candidate_count; i++) {
+        alp_choice choice =
+            estimate_alp(sampled, count, encoder->exponents[i], encoder->factors[i]);
+        if (choice.estimated_bits < best.estimated_bits) {
+            best = choice;
+        }
+    }
+    int remembered_places = encoder->exponents[0] - encoder->factors[0];
+    for (int places = 0; places < remembered_places; places++) {
+        alp_choice choice = estimate_alp(sampled, count, places, 0);
+        if (choice.estimated_bits < best.estimated_bits) {
+            best = choice;
         }
     }
     return best;
@@ -242,31 +314,40 @@ static uint32_t common_trailing_zeros(const double* values, uint32_t count, uint
     return zeros < limit ? zeros : limit;
 }
 
-/* Tries every split position on the sample and keeps the cheapest. */
-static rd_choice choose_rd_parameters(const sample* sampled, uint32_t count) {
+/* Estimates the encoded size of the chunk for one split position. */
+static rd_choice estimate_rd(const sample* sampled, uint32_t count, uint32_t right_width) {
+    uint32_t shift = common_trailing_zeros(sampled->values, sampled->size, right_width);
+    /* Zeroed so that GCC can see build_rd_dictionary never reads uninitialized entries. */
+    uint16_t left_parts[SAMPLE_SIZE] = {0};
+    for (uint32_t i = 0; i < sampled->size; i++) {
+        left_parts[i] = (uint16_t)(sx_double_to_bits(sampled->values[i]) >> right_width);
+    }
+    rd_dictionary dict;
+    build_rd_dictionary(left_parts, sampled->size, &dict);
+
+    uint32_t exceptions = 0;
+    for (uint32_t i = 0; i < sampled->size; i++) {
+        if (rd_dictionary_find(&dict, left_parts[i]) < 0) {
+            exceptions++;
+        }
+    }
+    uint64_t bits_per_value = right_width - shift + rd_code_width(dict.size);
+    rd_choice choice = {
+        .right_width = right_width,
+        .estimated_bits = (uint64_t)count * bits_per_value +
+                          scale_to_chunk(exceptions, sampled->size, count) * RD_EXCEPTION_BITS,
+    };
+    return choice;
+}
+
+/* Tries every split position on the sample and returns the cheapest. */
+static rd_choice search_rd(const sample* sampled, uint32_t count) {
     rd_choice best = {.right_width = RD_MAX_RIGHT_WIDTH, .estimated_bits = UINT64_MAX};
     for (uint32_t right_width = RD_MIN_RIGHT_WIDTH; right_width <= RD_MAX_RIGHT_WIDTH;
          right_width++) {
-        uint32_t shift = common_trailing_zeros(sampled->values, sampled->size, right_width);
-        uint16_t left_parts[SAMPLE_SIZE];
-        for (uint32_t i = 0; i < sampled->size; i++) {
-            left_parts[i] = (uint16_t)(sx_double_to_bits(sampled->values[i]) >> right_width);
-        }
-        rd_dictionary dict;
-        build_rd_dictionary(left_parts, sampled->size, &dict);
-
-        uint32_t exceptions = 0;
-        for (uint32_t i = 0; i < sampled->size; i++) {
-            if (rd_dictionary_find(&dict, left_parts[i]) < 0) {
-                exceptions++;
-            }
-        }
-        uint64_t bits_per_value = right_width - shift + rd_code_width(dict.size);
-        uint64_t bits = (uint64_t)count * bits_per_value +
-                        scale_to_chunk(exceptions, sampled->size, count) * RD_EXCEPTION_BITS;
-        if (bits < best.estimated_bits) {
-            best.right_width = right_width;
-            best.estimated_bits = bits;
+        rd_choice choice = estimate_rd(sampled, count, right_width);
+        if (choice.estimated_bits < best.estimated_bits) {
+            best = choice;
         }
     }
     return best;
@@ -413,13 +494,13 @@ static sx_err encode_with(sx_encoding encoding, const double* values, uint32_t c
             break;
         case SX_ENCODING_ALP: {
             take_sample(values, count, &sampled);
-            alp_choice choice = choose_alp_parameters(&sampled, count);
+            alp_choice choice = search_alp(&sampled, count, NULL);
             encode_alp(values, count, choice.exponent, choice.factor, out);
             break;
         }
         case SX_ENCODING_ALP_RD: {
             take_sample(values, count, &sampled);
-            rd_choice choice = choose_rd_parameters(&sampled, count);
+            rd_choice choice = search_rd(&sampled, count);
             encode_alp_rd(values, count, choice.right_width, out);
             break;
         }
@@ -439,8 +520,42 @@ size_t sx_double_encode_bound(uint32_t count) {
     return (size_t)count * sizeof(double);
 }
 
+void sx_double_encoder_init(sx_double_encoder* encoder) {
+    memset(encoder, 0, sizeof(*encoder));
+}
+
+/*
+ * Chooses ALP and ALP_RD parameters for the chunk, either by a full search or from what
+ * the encoder remembers about the previous chunks of the column.
+ */
+static void choose_parameters(sx_double_encoder* encoder, const sample* sampled, uint32_t count,
+                              alp_choice* alp, rd_choice* rd) {
+    if (encoder->candidate_count > 0 && encoder->chunks_until_search > 0) {
+        *alp = best_remembered_alp(encoder, sampled, count);
+        /* Clearly more exceptions than the full search saw means the data has changed. */
+        bool data_changed =
+            alp->sample_exceptions > encoder->search_exceptions + ALP_CHANGE_EXCEPTIONS;
+        if (!data_changed) {
+            *rd = estimate_rd(sampled, count, encoder->rd_right_width);
+            encoder->chunks_until_search--;
+            return;
+        }
+    }
+    *alp = search_alp(sampled, count, encoder);
+    *rd = search_rd(sampled, count);
+    encoder->rd_right_width = rd->right_width;
+    encoder->chunks_until_search = ALP_SEARCH_INTERVAL;
+}
+
 sx_err sx_double_encode(const double* values, uint32_t count, sx_byte_writer* out,
                         sx_encoding* chosen) {
+    sx_double_encoder encoder;
+    sx_double_encoder_init(&encoder);
+    return sx_double_encoder_encode(&encoder, values, count, out, chosen);
+}
+
+sx_err sx_double_encoder_encode(sx_double_encoder* encoder, const double* values, uint32_t count,
+                                sx_byte_writer* out, sx_encoding* chosen) {
     if (count == 0 || count > SX_VECTOR_SIZE) {
         return SX_ERR_INVALID_ARG;
     }
@@ -451,8 +566,9 @@ sx_err sx_double_encode(const double* values, uint32_t count, sx_byte_writer* ou
 
     sample sampled;
     take_sample(values, count, &sampled);
-    alp_choice alp = choose_alp_parameters(&sampled, count);
-    rd_choice rd = choose_rd_parameters(&sampled, count);
+    alp_choice alp;
+    rd_choice rd;
+    choose_parameters(encoder, &sampled, count, &alp, &rd);
     uint64_t raw_bits = (uint64_t)count * 64u;
 
     sx_encoding candidate = SX_ENCODING_RAW;

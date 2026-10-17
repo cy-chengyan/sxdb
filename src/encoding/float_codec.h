@@ -40,14 +40,42 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Number of exponent/factor pairs an encoder remembers between chunks. */
+#define SX_ALP_CANDIDATES 5u
+
+/*
+ * State carried across the chunks of one column while they are encoded in order.
+ *
+ * Choosing ALP parameters means trying all 190 exponent/factor pairs on a sample, which
+ * dominates the encoding time of small chunks. Successive chunks of a column almost
+ * always want the same few pairs, so the encoder remembers the best ones and tries only
+ * those. It repeats the full search every 64 chunks, and immediately when the remembered
+ * pairs produce clearly more exceptions than before (the data changed). The state only
+ * affects how long parameter choice takes and never the correctness of the output.
+ */
+typedef struct sx_double_encoder {
+    uint8_t exponents[SX_ALP_CANDIDATES];
+    uint8_t factors[SX_ALP_CANDIDATES];
+    uint32_t candidate_count;
+    uint32_t search_exceptions;   /* sample exceptions of the best pair at the last search */
+    uint32_t rd_right_width;      /* best ALP_RD split position at the last search */
+    uint32_t chunks_until_search; /* chunks left before the next full search */
+} sx_double_encoder;
+
 /* Largest payload any chosen encoding can produce for `count` values. */
 size_t sx_double_encode_bound(uint32_t count);
+
+void sx_double_encoder_init(sx_double_encoder* encoder);
 
 /*
  * Encodes 1 to SX_VECTOR_SIZE values, choosing among CONSTANT, ALP, ALP_RD, and RAW,
  * and reports the choice. `out` needs at least sx_double_encode_bound(count) free bytes.
  * Every value round-trips bit for bit, including NaN payloads and -0.0.
  */
+sx_err sx_double_encoder_encode(sx_double_encoder* encoder, const double* values, uint32_t count,
+                                sx_byte_writer* out, sx_encoding* chosen);
+
+/* Encodes a single chunk with a fresh encoder (always a full parameter search). */
 sx_err sx_double_encode(const double* values, uint32_t count, sx_byte_writer* out,
                         sx_encoding* chosen);
 

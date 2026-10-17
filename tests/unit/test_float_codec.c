@@ -196,6 +196,62 @@ static void test_corrupted_payloads_are_rejected(void) {
              SX_ERR_CORRUPT);
 }
 
+/* Fills a chunk for one phase of test_encoder_state_across_chunks. */
+static void fill_phase(double* values, uint32_t count, int phase, sx_rng* rng) {
+    int64_t level = 185600;
+    for (uint32_t i = 0; i < count; i++) {
+        level += (int64_t)sx_rng_below(rng, 11) - 5;
+        switch (phase) {
+            case 0: /* two decimal places */
+                values[i] = (double)level / 100.0;
+                break;
+            case 1: /* whole numbers: fewer places than before */
+                values[i] = (double)(level * 100);
+                break;
+            case 2: /* four decimal places: more places than before */
+                values[i] = (double)level / 10000.0;
+                break;
+            default: /* full precision */
+                values[i] = 20.0 + sx_rng_next_double(rng) * 10.0;
+                break;
+        }
+    }
+}
+
+/*
+ * An encoder reused across chunks must decode exactly and stay close to choosing the
+ * parameters afresh for every chunk, including when the data changes underneath it.
+ */
+static void test_encoder_state_across_chunks(void) {
+    sx_double_encoder encoder;
+    sx_double_encoder_init(&encoder);
+    sx_rng rng;
+    sx_rng_seed(&rng, 9);
+    size_t reused_total = 0;
+    size_t fresh_total = 0;
+    for (int phase = 0; phase < 4; phase++) {
+        for (int chunk = 0; chunk < 20; chunk++) {
+            double values[241];
+            fill_phase(values, 241, phase, &rng);
+
+            uint8_t buffer[241 * sizeof(double)];
+            sx_byte_writer writer;
+            sx_encoding encoding = SX_ENCODING_RAW;
+            sx_writer_init(&writer, buffer, sizeof(buffer));
+            SX_CHECK(sx_double_encoder_encode(&encoder, values, 241, &writer, &encoding) == SX_OK);
+            double decoded[SX_VECTOR_SIZE];
+            SX_CHECK(sx_double_decode(encoding, buffer, writer.size, 241, decoded) == SX_OK);
+            SX_CHECK_EQ_MEM(decoded, values, sizeof(values));
+            reused_total += writer.size;
+
+            sx_writer_init(&writer, buffer, sizeof(buffer));
+            SX_CHECK(sx_double_encode(values, 241, &writer, &encoding) == SX_OK);
+            fresh_total += writer.size;
+        }
+    }
+    SX_CHECK(reused_total * 100 <= fresh_total * 102);
+}
+
 static void test_random_payloads_never_crash(void) {
     static const sx_encoding encodings[] = {
         SX_ENCODING_RAW,
@@ -234,6 +290,7 @@ static const sx_test_case cases[] = {
     {"widened_floats", test_widened_floats_round_trip},
     {"forced_encodings", test_forced_encodings_round_trip},
     {"corrupted_payloads", test_corrupted_payloads_are_rejected},
+    {"encoder_state_across_chunks", test_encoder_state_across_chunks},
     {"random_payloads", test_random_payloads_never_crash},
 };
 
