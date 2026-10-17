@@ -2,7 +2,7 @@
 
 | Item | Value |
 |---|---|
-| Document version | 1.1 |
+| Document version | 1.2 |
 | Status | Milestone M0 (foundation and encodings) in progress |
 | Date | 2026-10-17 |
 | License | GPL-2.0-or-later (the Python client is MIT) |
@@ -46,7 +46,7 @@ This document is the design of sxdb; version 1.0 was the baseline, and later cha
 | Third-party code | Only GPLv2-compatible licenses (BSD, MIT, zlib, public domain, LGPL). **No Apache-2.0 code** |
 | Vendored dependencies | LZ4 (only `lib/`, BSD-2-Clause), ZSTD (BSD or GPLv2 dual license), linenoise (BSD-2-Clause, sxql only) |
 | Optional dependency | Mbed TLS (Apache-2.0 or GPL-2.0-or-later dual license), for TLS |
-| Written in-house | Roaring Bitmap, t-digest, HyperLogLog, ALP, Arrow IPC encoding (including a minimal FlatBuffers encoder), TZif time zone parsing, SHA-256, HMAC, PBKDF2 (for SCRAM) |
+| Written in-house | Roaring Bitmap, t-digest, HyperLogLog, ALP, Arrow IPC encoding (including a minimal FlatBuffers encoder), TZif time zone parsing, SHA-256, HMAC, PBKDF2 (for SCRAM), shortest round-trip floating-point formatting (Ryu-style) and fast exact number parsing (Eisel–Lemire-style) |
 | Compiler extensions | `__builtin_*`, `__attribute__`, etc. are wrapped in `sx_compiler.h`. C23 features (`[[nodiscard]]`, `<stdbit.h>`, etc.) are used through compatibility macros |
 | Human language | Error messages, logs, and all other system text are English only. Code comments and repository documentation are English only (see §15.2) |
 | Hosting | GitHub (see §15.3) |
@@ -114,6 +114,8 @@ CREATE TABLE cpu (
 
 Array elements can be numeric, `DECIMAL`, `BOOL`, or `TIMESTAMP`. Subscripts start at 1 and `[1:5]` slicing is supported, as in PostgreSQL.
 
+**Prices and amounts should use `DECIMAL`, not `DOUBLE`.** Arithmetic is exact, sums do not accumulate rounding error, and the data is smaller: on A-share 1-minute bars, a table with `DECIMAL` prices took 9.63 bytes per row against 10.71 with `DOUBLE` (MONTH partitions), about 10% less. Documentation examples and client type mappings follow this recommendation.
+
 ```sql
 CREATE TABLE l2_snapshot (
     ts       TIMESTAMP,
@@ -161,6 +163,17 @@ result:       open=10.0, close=10.6, volume=NULL
 
 ### 3.5 Partitioning
 Tables are partitioned by time, with a granularity of `HOUR`, `DAY`, `WEEK`, `MONTH`, or `YEAR`. Boundaries are in UTC.
+
+**Choosing the granularity**: a typical series should have at least 1024 rows per partition. Blocks are then full single-series blocks (see §4.3), which compress best and which queries read and skip with the least per-block overhead.
+
+| Data | Rows per series | Suggested granularity |
+|---|---|---|
+| Ticks, high-frequency metrics (1 s or faster) | Thousands or more per day | `DAY` (or `HOUR`) |
+| Monitoring metrics every 10–60 s | 1,440–8,640 per day | `DAY` |
+| 1-minute bars | About 240 per trading day | `MONTH` |
+| Daily bars | About 250 per year | `YEAR` |
+
+Measured on A-share 1-minute bars (5,571 symbols, 241 rows per symbol per day), `MONTH` partitions took 10.71 bytes per row against 12.30 with `DAY` partitions, 13% less. The average number of rows per block is reported per table (see §12.1), so a granularity that is too fine shows up directly.
 
 ---
 
@@ -213,6 +226,12 @@ All encodings are lightweight and SIMD-decodable. Following the performance-firs
 - Bit-packing uses a FastLanes-style interleaved layout of 1024 values, so even scalar code auto-vectorizes.
 - Cold partitions can add a ZSTD layer, enabled with the table option `cold_compression = 'zstd'` (off by default).
 - The byte layout of each encoding's payload is documented in its codec header (`src/encoding/*_codec.h`).
+
+**Codec speed** (targets in §16)
+- **Fused decoding**: unpacking, adding the FOR base and multiplier, and the ALP multiplication run in one pass over each 1024-value vector, so values stay in registers instead of making several passes through memory.
+- **Runtime SIMD dispatch**: every decoder has a portable C kernel plus AVX2 and AVX-512 kernels on x86_64 and NEON kernels on ARM64. The kernel set is chosen once at startup from the CPU features; the executor uses the same mechanism (see §8.1). The portable kernels are the reference: tests require every SIMD kernel to produce exactly the same output, including on the fuzzing corpus.
+- **Branch-free encoding**: ALP encodes a whole vector, decodes it back, and compares the two to find exceptions, in separate loops the compiler can vectorize, instead of testing each value as it goes.
+- **Parallel delta decoding**: rebuilding values from deltas (DELTA_FOR, DELTA_PATCHED) is a prefix sum, which is serial in the current layout and gains little from SIMD. A FastLanes-style transposed layout lets the 16 lanes compute independent prefix sums. It may cost some compression, so whether to adopt it is decided by measurement on real data in M0, before the segment format is frozen.
 
 ### 4.3 Block Formation
 1. The output of a flush or compaction is first sorted by `(series_id, ts)`.
@@ -295,7 +314,8 @@ u8 encoding | u8 flags (has NULL / all NULL / has unwritten) | u16 row_count | u
 
 ### 4.6 WAL
 - One WAL per instance, 64 MB per segment.
-- Record format: `[len u32][crc32c u32][lsn u64][commit_time i64][type u8][payload]`. LSNs increase monotonically across the instance; `commit_time` is used for point-in-time recovery.
+- Record format: `[len u32][crc32c u32][lsn u64][commit_time i64][type u8][flags u8][payload]`. LSNs increase monotonically across the instance; `commit_time` is used for point-in-time recovery.
+- `ROW_BATCH` payloads larger than 4 KB are compressed with LZ4 (flags bit 0), which keeps WAL bandwidth well below disk bandwidth at high write rates (see §7). The CRC covers the stored bytes, so a damaged record is detected before decompression.
 - Record types:
   - `ROW_BATCH`: a columnar batch already resolved to series_ids, with the list of written columns. Batches whose rows have different field sets (such as line protocol) also carry a per-row written mask. Definitions of series created by this batch (series_id and tag values) go in the same record, before the rows.
   - `DELETE`: a tombstone.
@@ -336,7 +356,7 @@ A frozen MemTable is written to disk in these steps:
 ### 4.10 Read Path
 1. At query start, pin a snapshot: the current Version (each table's segment set, reference counted), the catalog version, and the visible LSN.
 2. Prune partitions by time range. Use TAG conditions to get a candidate series set from the series index, then intersect it with each partition's active-series bitmap (see §5.1).
-3. For each segment: sparse index → block index → SMA check (use SMA directly where possible, without decoding) → fetch pages through the buffer pool → decode vector by vector.
+3. For each segment: sparse index → block index → SMA check (use SMA directly where possible, without decoding) → fetch pages through the buffer pool → evaluate filters, on encoded data where possible (see §5.3) → decode the remaining columns vector by vector, only for vectors with selected rows.
 4. Merge data from multiple segments and the MemTable by (series, ts). For each key, each column takes its most recent written value (skipping unwritten ones); then tombstones are filtered out. Only the columns the query needs are merged.
 5. **Fast path**: if a partition has a single segment and the MemTable holds no data for that partition (typical for cold data), skip merging and scan directly.
 
@@ -422,6 +442,13 @@ One per table. It must work from one series to hundreds of millions without requ
 
 ### 5.3 Value Filtering
 - Block-level min/max skip whole blocks. For example, with `WHERE usage > 90`, blocks whose maximum is below 90 are skipped.
+- **Filtering on encoded data**: in the blocks that remain, comparisons with constants on integer, `DECIMAL`, and `TIMESTAMP` columns are evaluated without rebuilding the values where the encoding allows it:
+  - FOR_BITPACK: the chunk's base and multiplier are folded into the constant, so `x > c` becomes a comparison on the unpacked offsets;
+  - CONSTANT and RLE: the comparison runs once per run;
+  - other encodings (and ALP for floating point) are decoded first, which is cheap.
+
+  The result is a selection vector per 1024-row vector.
+- **Late materialization**: the other columns the query needs are decoded only for vectors that have at least one selected row. Selective filters therefore decode little more than the filter columns.
 
 ### 5.4 SMA Pushdown
 - When a block falls entirely inside the query's time window and filters, the block header's min/max/sum/count/first/last are used directly, without decoding.
@@ -492,19 +519,25 @@ Every memory consumer allocates through the memory manager and shares one budget
 
 | Setting | Default | Notes |
 |---|---|---|
-| `io_threads` | 2 | Network IO plus CPU-heavy protocol parsing |
+| `io_threads` | max(2, cores/8) | Network IO plus CPU-heavy protocol parsing. Parsing is usually the first bottleneck of the write path, so this scales with the machine |
 | `write_shards` | max(1, cores/4) | Number of MemTable shards, each owned by one thread |
 | `query_threads` | cores | One pool shared by all queries |
 | `background_threads` | 2 | Flush, compaction, and other background tasks |
 
 **Writes**
 - A single WAL thread establishes the global order and hands data to shards in LSN order. Every shard receives its data already ordered, without locks.
-- One WAL is enough: 5 million points per second is roughly 50 MB/s of sequential writes, far below disk bandwidth. A single WAL also keeps point-in-time recovery simple.
+- One WAL is enough: 5 million points per second is roughly 50 MB/s of sequential writes, far below disk bandwidth. At higher rates (10 million rows per second of 8 columns is about 800 MB/s uncompressed), LZ4 compression of `ROW_BATCH` payloads (see §4.6) keeps it within reach of one thread and one disk; the compression ratio on real batches is measured in M1. A single WAL also keeps point-in-time recovery simple.
 
 **Queries**
 - Morsel-driven parallelism (Leis et al., SIGMOD 2014): a query is split into small tasks of "partition × block range" that workers pick up; partial results are combined at the end.
 - Queries are scheduled round-robin, so one large query cannot occupy the whole pool. Each query can have a parallelism cap and a priority; backups and exports run at low priority.
 - Workers encode results directly into PG or Arrow format; IO threads only send them. When a client reads slowly, the query pauses instead of piling results up in memory.
+
+**NUMA** (Linux machines with more than one memory node; macOS machines have one)
+- At startup the node topology is read from `/sys/devices/system/node`. Query workers and shard threads are split evenly across nodes and pinned to them.
+- Buffer pool frames belong to a node: a frame is filled by a thread on the node that reads it, so its memory is placed there (first-touch placement; `mbind(2)` is called directly where needed, with no libnuma dependency). The memory budget stays global.
+- Morsels are dispatched first to workers on the node that holds their pages; idle workers steal from other nodes, as in the morsel-driven design.
+- `numa = auto | off` (default `auto`): `off` disables pinning and placement, for example to compare in benchmarks.
 
 **Isolation**
 - **Writes**: a batch becomes visible entirely or not at all.
@@ -530,7 +563,7 @@ Every memory consumer allocates through the memory manager and shares one budget
   5. Aggregate pushdown to SMA
   6. `LIMIT` and `ORDER BY ts` pushdown
   7. Streaming aggregation when grouping by series or time (data is already ordered), with no hash table
-- **Executor**: vectorized Volcano model; each `next()` returns 1024 rows, and vectors use the Arrow memory layout directly. Operators are type-specialized tight loops (generated with macros), plus optional AVX2/NEON kernels selected at runtime by CPU.
+- **Executor**: vectorized Volcano model; each `next()` returns 1024 rows, and vectors use the Arrow memory layout directly. Operators are type-specialized tight loops (generated with macros), plus AVX2, AVX-512, and NEON kernels chosen once at startup by CPU features, with the same dispatch mechanism as the decoders (see §4.2).
 
 ### 8.2 DDL
 - `CREATE/DROP DATABASE`. The database in the connection parameters is the default; `db.table` reaches across databases.
@@ -684,12 +717,14 @@ Multi-statement transactions, `UPDATE`, foreign keys, triggers, stored procedure
 ### 9.1 PostgreSQL Wire Protocol v3
 - Simple and extended query protocols, binary result format, `COPY FROM/TO STDIN` (csv/text), cancel requests.
 - Authentication with SCRAM-SHA-256.
+- Text-format results format floating-point values with an in-house shortest round-trip algorithm (Ryu-style), not `printf`, whose cost often dominates large result sets. Numbers in text input are parsed with a fast exact algorithm (Eisel–Lemire-style). The binary format and Arrow need no formatting at all and are recommended for large results.
 - Later: `COPY ... TO STDOUT (FORMAT binary)` and a fuller `pg_catalog`, so `adbc-driver-postgresql` and ConnectorX can connect directly.
 
 ### 9.2 InfluxDB Line Protocol
 - Over TCP and HTTP. HTTP provides compatible `/write` (v1) and `/api/v2/write` endpoints, so Telegraf works out of the box.
 - Token authentication.
 - Line protocol has no arrays; array columns are written through the PG protocol, Arrow, or the C API.
+- Parsing is the most CPU-heavy step of the write path. Lines are parsed straight into columnar batches with no per-row allocation; numbers and timestamps use the fast parsers from §9.1. Bulk loads should use Arrow or `COPY`, which skip text parsing.
 
 ### 9.3 HTTP API
 | Endpoint | Description |
@@ -898,6 +933,7 @@ Nothing is added to the write or query hot paths, there is no background samplin
 | Memory usage | The memory manager already keeps these counters. Process RSS is read once from the OS per request | None |
 | Number of databases | Read from the catalog | None |
 | Free disk space | One `statvfs` call per request | None |
+| Average rows per block, per table and partition | Block and row counts added when segments are committed | None |
 
 **Service states**
 
@@ -1167,7 +1203,7 @@ static char* sx_join(const char* a, const char* b, size_t* out_len) {
   - ASan, UBSan, TSan;
   - clang-format and clang-tidy checks, non-ASCII check;
   - CodeQL static analysis.
-- **Nightly jobs**: long fuzzing runs, crash injection, performance benchmarks, with alerts when performance regresses beyond a threshold.
+- **Nightly jobs**: long fuzzing runs, crash injection, performance benchmarks, with alerts when performance regresses beyond a threshold. Benchmarks run on a dedicated machine, not on shared CI runners, which are too noisy for regression thresholds (see §16).
 - **Pipeline security**: GitHub Actions pinned by commit SHA; minimal token permissions per job; a protected main branch where CI must pass before merging.
 
 ### 15.4 Release and Packaging
@@ -1210,6 +1246,13 @@ Benchmarks use the industry-standard TSBS (Time Series Benchmark Suite), compari
 | Storage | ≤ 2 bytes/point (typical monitoring and market data) |
 | Idle memory | < 20 MB (before the buffer pool has loaded data) |
 | Aggregation over 100 million points | Sub-second; milliseconds when served by SMA |
+| Decoding (lightweight encodings, data in CPU cache) | ≥ 1 value per CPU cycle per core |
+| Encoding | ≥ 0.2 values per CPU cycle per core |
+
+**Method**
+- Micro-benchmarks report values per CPU cycle next to MB/s, plus hardware counters from `perf stat` (IPC, branch misses), so results compare across machines and point at the cause of a slowdown.
+- Measurements run on a dedicated machine with a fixed CPU frequency policy, pinned to one NUMA node (`numactl --cpunodebind=0 --membind=0`). Every performance change is compared against a stored baseline from the same machine.
+- Before the end-to-end comparison is possible, the same real data set is loaded into the compared databases to compare disk usage per row.
 
 ---
 
@@ -1217,12 +1260,12 @@ Benchmarks use the industry-standard TSBS (Time Series Benchmark Suite), compari
 
 | Milestone | Scope | Deliverable |
 |---|---|---|
-| M0 | GitHub repository and CI; project skeleton, base libraries, logging, memory manager, encoders and micro-benchmarks | Compression ratios and codec speeds validated on real data; encoding formats finalized |
+| M0 | GitHub repository and CI; project skeleton, base libraries, logging, memory manager, encoders and micro-benchmarks; fused SIMD decode kernels with runtime dispatch | Compression ratios and codec speeds validated on real data; encoding formats finalized |
 | M1 | Storage engine: WAL, MemTable, segments, MANIFEST, partitions, series index (with active bitmaps), buffer pool, crash recovery; `FORMAT` feature flags; storage and memory counters, `sxdb_status()` | Read/write through the embedded C API |
 | M2 | SQL: parser, optimizer, vectorized executor, aggregates, time-series functions, window functions, ASOF JOIN; sxql local mode | SQL queries locally through sxql |
 | M3 | Server: PG wire protocol, line protocol, HTTP, Arrow IPC read/write, Python client, authentication and privileges, secure deployment; sxql network mode; observability (`/health`, `/metrics`, status system tables, systemd notification) | sxql, psql, Grafana, Telegraf, pandas/polars, Prometheus can connect |
 | M4 | Compaction, TTL, dead series cleanup, DELETE, bulk import, Last Cache, backup and restore (full, incremental, point-in-time) | Ready for trial use |
-| M5 | Continuous aggregates; performance: SIMD kernels, parallel query tuning, SMA pushdown, spilling large hash tables and sorts to disk, TSBS comparison | Performance report |
+| M5 | Continuous aggregates; performance: SIMD kernels for executor operators, NUMA placement, parallel query tuning, SMA pushdown, spilling large hash tables and sorts to disk, TSBS comparison | Performance report |
 | M6 | Hardening: continuous fuzzing, crash injection, security audit; `sxdb upgrade` (check, snapshot, finalize) and upgrade tests; PG binary COPY and `pg_catalog` (ADBC/ConnectorX); TLS; release pipeline (deb/rpm, Homebrew, Docker image, signing); documentation | v1.0 |
 
 M0 starts with the encoders on purpose: compression ratio and decoding speed set the performance ceiling of the whole system, so they should be validated on real data as early as possible.
@@ -1265,6 +1308,7 @@ io_threads          = 2
 write_shards        = 4
 query_threads       = 16
 background_threads  = 2
+numa                = auto          # auto | off
 
 # Network (localhost only by default)
 pg_listen           = 127.0.0.1:5440
