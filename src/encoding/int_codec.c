@@ -5,6 +5,7 @@
 #include "common/bits.h"
 #include "common/compiler.h"
 #include "encoding/bitpack.h"
+#include "encoding/kernels.h"
 
 #include <stdbool.h>
 #include <string.h>
@@ -27,6 +28,7 @@ typedef struct int_stats {
     /* Frame of reference over the values: value = min + packed * for_multiplier. */
     uint64_t for_multiplier;
     uint32_t for_width;
+    uint64_t for_offsets[SX_VECTOR_SIZE]; /* value - min, before division */
 
     /* Frame of reference over consecutive differences (only when count >= 2):
      * delta[i] = delta_min + delta_offsets[i] * delta_multiplier. */
@@ -83,6 +85,80 @@ static uint64_t divide_exact(uint64_t dividend, exact_divisor divisor) {
     return (dividend >> divisor.shift) * divisor.inverse;
 }
 
+/*
+ * Tests whether numbers are multiples of a divisor with one multiplication: x is a multiple
+ * of d = odd * 2^shift exactly when its low `shift` bits are zero and
+ * (x >> shift) * inverse(odd) (mod 2^64) is at most (2^64 - 1) / odd.
+ */
+typedef struct multiple_test {
+    exact_divisor exact;
+    uint64_t low_bits;     /* mask of the low `shift` bits */
+    uint64_t max_quotient; /* (2^64 - 1) / odd */
+} multiple_test;
+
+static multiple_test make_multiple_test(uint64_t divisor) {
+    multiple_test test;
+    test.exact = make_exact_divisor(divisor);
+    test.low_bits = sx_low_mask_u64(test.exact.shift);
+    test.max_quotient = UINT64_MAX / (divisor >> test.exact.shift);
+    return test;
+}
+
+/* Zero exactly when x is a multiple; computed without branches. */
+static uint64_t multiple_miss(uint64_t x, const multiple_test* test) {
+    uint64_t quotient = (x >> test->exact.shift) * test->exact.inverse;
+    return (x & test->low_bits) | (uint64_t)(quotient > test->max_quotient);
+}
+
+/*
+ * Index of the first number from `start` on that is not a multiple, or `count`. Blocks of
+ * 16 numbers are tested with one branch, since nearly all numbers are multiples.
+ */
+static uint32_t first_non_multiple(const uint64_t* numbers, uint32_t start, uint32_t count,
+                                   const multiple_test* test) {
+    uint32_t i = start;
+    while (i + 16u <= count) {
+        uint64_t misses = 0;
+        for (uint32_t j = 0; j < 16u; j++) {
+            misses |= multiple_miss(numbers[i + j], test);
+        }
+        if (misses != 0) {
+            break;
+        }
+        i += 16u;
+    }
+    while (i < count && multiple_miss(numbers[i], test) == 0) {
+        i++;
+    }
+    return i;
+}
+
+/*
+ * Greatest common divisor of `count` numbers, 0 if they are all 0. Most numbers are
+ * multiples of the divisor found so far, which multiple_miss confirms cheaply; only the
+ * others need a gcd computation. The divisor only shrinks, so that happens rarely, and
+ * once it reaches 1 the scan stops.
+ */
+static uint64_t common_divisor(const uint64_t* numbers, uint32_t count) {
+    uint32_t i = 0;
+    while (i < count && numbers[i] == 0) {
+        i++;
+    }
+    if (i == count) {
+        return 0;
+    }
+    uint64_t divisor = numbers[i];
+    while (divisor != 1) {
+        multiple_test test = make_multiple_test(divisor);
+        i = first_non_multiple(numbers, i + 1u, count, &test);
+        if (i == count) {
+            break;
+        }
+        divisor = sx_gcd_u64(divisor, numbers[i]);
+    }
+    return divisor;
+}
+
 /* Bit width of the largest offset after dividing by the multiplier. */
 static uint32_t packed_width(uint64_t range, uint64_t multiplier) {
     if (multiplier == 0) {
@@ -91,59 +167,58 @@ static uint32_t packed_width(uint64_t range, uint64_t multiplier) {
     return sx_bit_width_u64(range / multiplier);
 }
 
+static int64_t min_i64(int64_t a, int64_t b) {
+    return b < a ? b : a;
+}
+
+static int64_t max_i64(int64_t a, int64_t b) {
+    return b > a ? b : a;
+}
+
 static void compute_stats(const int64_t* values, uint32_t count, int_stats* stats) {
-    memset(stats, 0, sizeof(*stats));
-    stats->count = count;
-    stats->min = values[0];
-    stats->max = values[0];
-    stats->run_count = 1;
-
-    int64_t delta_max = 0;
-    if (count >= 2) {
-        stats->delta_min = wrapping_delta(values[1], values[0]);
-        delta_max = stats->delta_min;
-    }
-
+    /* Running values are kept in locals: `values` could alias `stats`, which would make
+     * the compiler store every update. The minimum and maximum are conditional moves. */
+    int64_t min = values[0];
+    int64_t max = values[0];
+    int64_t delta_min = count >= 2 ? wrapping_delta(values[1], values[0]) : 0;
+    int64_t delta_max = delta_min;
+    uint32_t value_changes = 0;
     for (uint32_t i = 1; i < count; i++) {
         int64_t value = values[i];
         int64_t delta = wrapping_delta(value, values[i - 1]);
-        if (value < stats->min) {
-            stats->min = value;
-        }
-        if (value > stats->max) {
-            stats->max = value;
-        }
-        if (value != values[i - 1]) {
-            stats->run_count++;
-        }
-        if (delta < stats->delta_min) {
-            stats->delta_min = delta;
-        }
-        if (delta > delta_max) {
-            delta_max = delta;
-        }
+        min = min_i64(min, value);
+        max = max_i64(max, value);
+        delta_min = min_i64(delta_min, delta);
+        delta_max = max_i64(delta_max, delta);
+        value_changes += (uint32_t)(value != values[i - 1]);
     }
-    stats->deltas_equal = count >= 2 && stats->delta_min == delta_max;
+    stats->count = count;
+    stats->min = min;
+    stats->max = max;
+    stats->run_count = 1 + value_changes;
+    stats->deltas_equal = count >= 2 && delta_min == delta_max;
+    stats->delta_min = delta_min;
+    stats->patch_width = 0;
+    stats->patch_exceptions = 0;
+    stats->patch_size = 0;
 
-    /* Once a divisor reaches 1 it cannot shrink further, so the scans stop early. */
-    for (uint32_t i = 0; i < count && stats->for_multiplier != 1; i++) {
-        stats->for_multiplier =
-            sx_gcd_u64(stats->for_multiplier, offset_from(values[i], stats->min));
+    /* The multipliers are the common divisors of the offsets from each frame's base. */
+    for (uint32_t i = 0; i < count; i++) {
+        stats->for_offsets[i] = offset_from(values[i], min);
     }
-    for (uint32_t i = 1; i < count && stats->delta_multiplier != 1; i++) {
-        int64_t delta = wrapping_delta(values[i], values[i - 1]);
-        stats->delta_multiplier =
-            sx_gcd_u64(stats->delta_multiplier, offset_from(delta, stats->delta_min));
-    }
-
-    stats->for_width = packed_width(offset_from(stats->max, stats->min), stats->for_multiplier);
-    stats->delta_width =
-        packed_width(offset_from(delta_max, stats->delta_min), stats->delta_multiplier);
-
-    exact_divisor divisor = make_exact_divisor(stats->delta_multiplier);
+    stats->for_multiplier = common_divisor(stats->for_offsets, count);
     for (uint32_t i = 1; i < count; i++) {
         int64_t delta = wrapping_delta(values[i], values[i - 1]);
-        stats->delta_offsets[i - 1] = divide_exact(offset_from(delta, stats->delta_min), divisor);
+        stats->delta_offsets[i - 1] = offset_from(delta, delta_min);
+    }
+    stats->delta_multiplier = common_divisor(stats->delta_offsets, count - 1);
+
+    stats->for_width = packed_width(offset_from(max, min), stats->for_multiplier);
+    stats->delta_width = packed_width(offset_from(delta_max, delta_min), stats->delta_multiplier);
+
+    exact_divisor divisor = make_exact_divisor(stats->delta_multiplier);
+    for (uint32_t i = 0; i + 1 < count; i++) {
+        stats->delta_offsets[i] = divide_exact(stats->delta_offsets[i], divisor);
     }
 }
 
@@ -165,9 +240,26 @@ static void choose_patch_width(int_stats* stats) {
         return;
     }
     uint32_t delta_count = stats->count - 1;
-    uint32_t width_counts[65] = {0};
-    for (uint32_t i = 0; i < delta_count; i++) {
-        width_counts[sx_bit_width_u64(stats->delta_offsets[i])]++;
+    /* Neighboring offsets usually have the same width; four separate histograms keep the
+     * increments of one counter from waiting on each other. */
+    uint32_t counts0[65] = {0};
+    uint32_t counts1[65] = {0};
+    uint32_t counts2[65] = {0};
+    uint32_t counts3[65] = {0};
+    const uint64_t* offsets = stats->delta_offsets;
+    uint32_t i = 0;
+    for (; i + 4u <= delta_count; i += 4u) {
+        counts0[sx_bit_width_u64(offsets[i])]++;
+        counts1[sx_bit_width_u64(offsets[i + 1u])]++;
+        counts2[sx_bit_width_u64(offsets[i + 2u])]++;
+        counts3[sx_bit_width_u64(offsets[i + 3u])]++;
+    }
+    for (; i < delta_count; i++) {
+        counts0[sx_bit_width_u64(offsets[i])]++;
+    }
+    uint32_t width_counts[65];
+    for (uint32_t width = 0; width <= 64; width++) {
+        width_counts[width] = counts0[width] + counts1[width] + counts2[width] + counts3[width];
     }
 
     size_t unpatched = DELTA_FOR_HEADER_SIZE + sx_bitpack_size(delta_count, stats->delta_width);
@@ -230,11 +322,19 @@ static void write_packed(sx_byte_writer* out, const uint64_t* offsets, uint32_t 
     }
 }
 
-static void encode_for(const int64_t* values, const int_stats* stats, sx_byte_writer* out) {
+/* Packs delta offsets in the lane-contiguous order (see bitpack.h). */
+static void write_packed_deltas(sx_byte_writer* out, const uint64_t* offsets, uint32_t count,
+                                uint32_t width) {
+    uint64_t lane_ordered[SX_VECTOR_SIZE];
+    sx_bitpack_to_lane_order(offsets, count, lane_ordered);
+    write_packed(out, lane_ordered, sx_bitpack_padded_count(count), width);
+}
+
+static void encode_for(const int_stats* stats, sx_byte_writer* out) {
     uint64_t offsets[SX_VECTOR_SIZE];
     exact_divisor divisor = make_exact_divisor(stats->for_multiplier);
     for (uint32_t i = 0; i < stats->count; i++) {
-        offsets[i] = divide_exact(offset_from(values[i], stats->min), divisor);
+        offsets[i] = divide_exact(stats->for_offsets[i], divisor);
     }
     sx_writer_put_i64(out, stats->min);
     sx_writer_put_u64(out, stats->for_multiplier);
@@ -249,7 +349,7 @@ static void encode_delta_for(const int64_t* values, const int_stats* stats, sx_b
     sx_writer_put_u64(out, stats->delta_multiplier);
     sx_writer_put_u8(out, (uint8_t)stats->delta_width);
     write_padding(out, HEADER_PADDING);
-    write_packed(out, stats->delta_offsets, stats->count - 1, stats->delta_width);
+    write_packed_deltas(out, stats->delta_offsets, stats->count - 1, stats->delta_width);
 }
 
 static void encode_delta_patched(const int64_t* values, const int_stats* stats,
@@ -278,7 +378,7 @@ static void encode_delta_patched(const int64_t* values, const int_stats* stats,
     write_padding(out, 1);
     sx_writer_put_u16(out, (uint16_t)exceptions);
     write_padding(out, 4);
-    write_packed(out, packed, delta_count, stats->patch_width);
+    write_packed_deltas(out, packed, delta_count, stats->patch_width);
     sx_writer_put_bytes(out, exception_positions, (size_t)exceptions * sizeof(uint16_t));
     sx_writer_pad_to(out, 8);
     sx_writer_put_bytes(out, exception_offsets, (size_t)exceptions * sizeof(uint64_t));
@@ -325,7 +425,7 @@ static sx_err encode_with(sx_encoding encoding, const int64_t* values, const int
             encode_rle(values, stats->count, out);
             break;
         case SX_ENCODING_FOR_BITPACK:
-            encode_for(values, stats, out);
+            encode_for(stats, out);
             break;
         case SX_ENCODING_DELTA_FOR:
             encode_delta_for(values, stats, out);
@@ -396,17 +496,12 @@ sx_err sx_int64_encode_as(sx_encoding encoding, const int64_t* values, uint32_t 
 /* Decoders                                                                                 */
 /* ---------------------------------------------------------------------------------------- */
 
-/* Reads `count` packed values of a header's width; returns false on malformed input. */
-static bool read_packed(sx_byte_reader* in, uint32_t count, uint32_t width, uint64_t* values) {
+/* Takes the block of `count` values packed at a header's width; NULL if malformed. */
+static const uint8_t* take_packed(sx_byte_reader* in, uint32_t count, uint32_t width) {
     if (width > 64) {
-        return false;
+        return NULL;
     }
-    const uint8_t* packed = sx_reader_take(in, sx_bitpack_size(count, width));
-    if (packed == NULL) {
-        return false;
-    }
-    sx_bitunpack_u64(packed, count, width, values);
-    return true;
+    return sx_reader_take(in, sx_bitpack_size(count, width));
 }
 
 static bool decode_raw(sx_byte_reader* in, uint32_t count, int64_t* out) {
@@ -469,39 +564,19 @@ static bool decode_for(sx_byte_reader* in, uint32_t count, int64_t* out) {
     uint32_t width = sx_reader_get_u8(in);
     sx_reader_take(in, HEADER_PADDING);
 
-    uint64_t offsets[SX_VECTOR_SIZE];
-    if (!read_packed(in, count, width, offsets)) {
+    const uint8_t* packed = take_packed(in, count, width);
+    if (packed == NULL) {
         return false;
     }
-    if (multiplier == 1) {
-        for (uint32_t i = 0; i < count; i++) {
-            out[i] = (int64_t)(base + offsets[i]);
-        }
-    } else {
-        for (uint32_t i = 0; i < count; i++) {
-            out[i] = (int64_t)(base + offsets[i] * multiplier);
-        }
-    }
+    sx_codec_kernels_active()->decode_for(packed, count, width, base, multiplier, (uint64_t*)out);
     return true;
 }
 
 /*
- * Turns `count - 1` packed delta offsets back into values: each delta is
- * delta_base + offset * multiplier, and each value adds a delta to the previous one.
+ * The deltas of DELTA_FOR and DELTA_PATCHED are delta_base + offset * multiplier, with the
+ * `count - 1` offsets packed in the lane-contiguous order. They are decoded like
+ * FOR_BITPACK into `deltas`, patched if needed, and then summed up by rebuild_deltas.
  */
-static void rebuild_from_deltas(uint64_t first, uint64_t delta_base, uint64_t multiplier,
-                                uint64_t* offsets, uint32_t count, int64_t* out) {
-    for (uint32_t i = 0; i < count - 1; i++) {
-        offsets[i] = delta_base + offsets[i] * multiplier;
-    }
-    uint64_t value = first;
-    out[0] = (int64_t)value;
-    for (uint32_t i = 1; i < count; i++) {
-        value += offsets[i - 1];
-        out[i] = (int64_t)value;
-    }
-}
-
 static bool decode_delta_for(sx_byte_reader* in, uint32_t count, int64_t* out) {
     uint64_t first = sx_reader_get_u64(in);
     uint64_t delta_base = sx_reader_get_u64(in);
@@ -512,11 +587,15 @@ static bool decode_delta_for(sx_byte_reader* in, uint32_t count, int64_t* out) {
         return false;
     }
 
-    uint64_t offsets[SX_VECTOR_SIZE];
-    if (!read_packed(in, count - 1, width, offsets)) {
+    uint32_t delta_count = count - 1;
+    const uint8_t* packed = take_packed(in, delta_count, width);
+    if (packed == NULL) {
         return false;
     }
-    rebuild_from_deltas(first, delta_base, multiplier, offsets, count, out);
+    const sx_codec_kernels* kernels = sx_codec_kernels_active();
+    uint64_t deltas[SX_VECTOR_SIZE];
+    kernels->decode_for(packed, delta_count, width, delta_base, multiplier, deltas);
+    kernels->rebuild_deltas(deltas, delta_count, first, (uint64_t*)out);
     return true;
 }
 
@@ -532,24 +611,29 @@ static bool decode_delta_patched(sx_byte_reader* in, uint32_t count, int64_t* ou
         return false;
     }
 
-    uint64_t offsets[SX_VECTOR_SIZE];
-    if (!read_packed(in, count - 1, width, offsets)) {
-        return false;
-    }
+    uint32_t delta_count = count - 1;
+    const uint8_t* packed = take_packed(in, delta_count, width);
     const uint8_t* positions = sx_reader_take(in, (size_t)exceptions * sizeof(uint16_t));
     sx_reader_skip_to(in, 8);
     const uint8_t* patches = sx_reader_take(in, (size_t)exceptions * sizeof(uint64_t));
-    if (positions == NULL || patches == NULL) {
+    if (packed == NULL || positions == NULL || patches == NULL) {
         return false;
     }
+    const sx_codec_kernels* kernels = sx_codec_kernels_active();
+    uint64_t deltas[SX_VECTOR_SIZE];
+    kernels->decode_for(packed, delta_count, width, delta_base, multiplier, deltas);
+
+    /* An exception replaces the offset of its slot (whose packed value is 0). */
+    uint32_t rows = sx_bitpack_rows(delta_count);
     for (uint32_t i = 0; i < exceptions; i++) {
         uint32_t position = sx_load_u16(positions + i * sizeof(uint16_t));
-        if (position >= count - 1) {
+        if (position >= delta_count) {
             return false;
         }
-        offsets[position] = sx_load_u64(patches + i * sizeof(uint64_t));
+        uint64_t offset = sx_load_u64(patches + i * sizeof(uint64_t));
+        deltas[sx_bitpack_lane_position(position, rows)] = delta_base + offset * multiplier;
     }
-    rebuild_from_deltas(first, delta_base, multiplier, offsets, count, out);
+    kernels->rebuild_deltas(deltas, delta_count, first, (uint64_t*)out);
     return true;
 }
 

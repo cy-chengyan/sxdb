@@ -5,6 +5,7 @@
 #include "common/bits.h"
 #include "common/compiler.h"
 #include "encoding/bitpack.h"
+#include "encoding/kernels.h"
 
 #include <stdbool.h>
 #include <string.h>
@@ -31,13 +32,6 @@
 /* Bits needed to store one ALP exception: a u16 position and the f64 value. */
 #define ALP_EXCEPTION_BITS 80u
 
-/*
- * Rounding by adding and subtracting 2^52 + 2^51 is exact round-to-nearest for
- * |x| < 2^51; larger values are treated as exceptions.
- */
-#define ALP_ROUND_MAGIC 6755399441055744.0
-#define ALP_ROUND_LIMIT 2251799813685248.0
-
 static const double POW10[ALP_MAX_EXPONENT + 1] = {
     1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,
     1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18,
@@ -49,27 +43,26 @@ static const double NEG_POW10[ALP_MAX_EXPONENT + 1] = {
 };
 
 /*
- * The decoding formula. The encoder uses this same function to verify every value, so
- * encoder and decoder can never disagree.
+ * The powers of ten of an exponent/factor pair. Encoding and decoding formulas are in
+ * kernels.h (sx_alp_encode_value, sx_alp_decode); the encoder verifies every value with
+ * the decoding formula, so encoder and decoder can never disagree.
  */
-static inline double alp_decode_value(int64_t digits, int exponent, int factor) {
-    return (double)digits * POW10[factor] * NEG_POW10[exponent];
+static sx_alp_scales alp_scales(int exponent, int factor) {
+    sx_alp_scales scales = {
+        .encode_exponent = POW10[exponent],
+        .encode_factor = NEG_POW10[factor],
+        .decode_factor = POW10[factor],
+        .decode_exponent = NEG_POW10[exponent],
+    };
+    return scales;
 }
 
-/* Encodes one value; returns false if it does not round-trip exactly. */
-static bool alp_encode_value(double value, int exponent, int factor, int64_t* digits) {
-    double scaled = value * POW10[exponent] * NEG_POW10[factor];
-    if (!(scaled > -ALP_ROUND_LIMIT && scaled < ALP_ROUND_LIMIT)) {
-        return false;
+/* Bit width of the frame of reference over the digits of the encoded values. */
+static uint32_t alp_width(const sx_alp_digit_range* range) {
+    if (range->min > range->max) {
+        return 0; /* every value is an exception */
     }
-    double rounded = (scaled + ALP_ROUND_MAGIC) - ALP_ROUND_MAGIC;
-    int64_t candidate = (int64_t)rounded;
-    double decoded = alp_decode_value(candidate, exponent, factor);
-    if (sx_double_to_bits(decoded) != sx_double_to_bits(value)) {
-        return false;
-    }
-    *digits = candidate;
-    return true;
+    return sx_bit_width_u64((uint64_t)range->max - (uint64_t)range->min);
 }
 
 /* ---------------------------------------------------------------------------------------- */
@@ -123,30 +116,17 @@ typedef struct alp_choice {
 
 /* Estimates the encoded size of the chunk for one exponent/factor pair. */
 static alp_choice estimate_alp(const sample* sampled, uint32_t count, int exponent, int factor) {
-    uint32_t exceptions = 0;
-    bool any_encoded = false;
-    int64_t min_digits = 0;
-    int64_t max_digits = 0;
-    for (uint32_t i = 0; i < sampled->size; i++) {
-        int64_t digits = 0;
-        if (!alp_encode_value(sampled->values[i], exponent, factor, &digits)) {
-            exceptions++;
-        } else if (!any_encoded) {
-            min_digits = digits;
-            max_digits = digits;
-            any_encoded = true;
-        } else if (digits < min_digits) {
-            min_digits = digits;
-        } else if (digits > max_digits) {
-            max_digits = digits;
-        }
-    }
-    uint32_t width = sx_bit_width_u64((uint64_t)max_digits - (uint64_t)min_digits);
+    sx_alp_scales scales = alp_scales(exponent, factor);
+    int64_t digits[SAMPLE_SIZE];
+    uint64_t exception_bits[(SAMPLE_SIZE + 63u) / 64u];
+    sx_alp_digit_range range;
+    uint32_t exceptions = sx_codec_kernels_active()->encode_alp(
+        sampled->values, sampled->size, &scales, digits, exception_bits, &range);
     alp_choice choice = {
         .exponent = exponent,
         .factor = factor,
         .sample_exceptions = exceptions,
-        .estimated_bits = (uint64_t)count * width +
+        .estimated_bits = (uint64_t)count * alp_width(&range) +
                           scale_to_chunk(exceptions, sampled->size, count) * ALP_EXCEPTION_BITS,
     };
     return choice;
@@ -340,6 +320,22 @@ static rd_choice estimate_rd(const sample* sampled, uint32_t count, uint32_t rig
     return choice;
 }
 
+/*
+ * Like estimate_rd, but skips the dictionary when ALP_RD cannot beat `alp_bits`: it needs
+ * at least (right_width - trailing zeros) bits per value. ALP wins ties, so the choice is
+ * the same as with the full estimate.
+ */
+static rd_choice estimate_rd_unless_worse(const sample* sampled, uint32_t count,
+                                          uint32_t right_width, uint64_t alp_bits) {
+    uint32_t shift = common_trailing_zeros(sampled->values, sampled->size, right_width);
+    uint64_t lower_bound = (uint64_t)count * (right_width - shift);
+    if (lower_bound >= alp_bits) {
+        rd_choice skipped = {.right_width = right_width, .estimated_bits = UINT64_MAX};
+        return skipped;
+    }
+    return estimate_rd(sampled, count, right_width);
+}
+
 /* Tries every split position on the sample and returns the cheapest. */
 static rd_choice search_rd(const sample* sampled, uint32_t count) {
     rd_choice best = {.right_width = RD_MAX_RIGHT_WIDTH, .estimated_bits = UINT64_MAX};
@@ -377,47 +373,40 @@ static void write_packed(sx_byte_writer* out, const uint64_t* values, uint32_t c
 
 static void encode_alp(const double* values, uint32_t count, int exponent, int factor,
                        sx_byte_writer* out) {
+    const sx_codec_kernels* kernels = sx_codec_kernels_active();
+    sx_alp_scales scales = alp_scales(exponent, factor);
     int64_t digits[SX_VECTOR_SIZE];
-    uint16_t exception_positions[SX_VECTOR_SIZE];
-    uint32_t exception_count = 0;
-    bool any_encoded = false;
-    int64_t min_digits = 0;
-    int64_t max_digits = 0;
-
-    for (uint32_t i = 0; i < count; i++) {
-        if (!alp_encode_value(values[i], exponent, factor, &digits[i])) {
-            exception_positions[exception_count] = (uint16_t)i;
-            exception_count++;
-            continue;
-        }
-        if (!any_encoded || digits[i] < min_digits) {
-            min_digits = digits[i];
-        }
-        if (!any_encoded || digits[i] > max_digits) {
-            max_digits = digits[i];
-        }
-        any_encoded = true;
-    }
+    uint64_t exception_bits[SX_VECTOR_SIZE / 64];
+    sx_alp_digit_range range;
+    kernels->encode_alp(values, count, &scales, digits, exception_bits, &range);
+    uint32_t width = alp_width(&range);
+    int64_t base = range.min <= range.max ? range.min : 0; /* 0 if all are exceptions */
 
     /* Exceptions get the base as a placeholder so they do not widen the packed range. */
-    for (uint32_t i = 0; i < exception_count; i++) {
-        digits[exception_positions[i]] = min_digits;
+    uint16_t exception_positions[SX_VECTOR_SIZE];
+    uint32_t exception_count = 0;
+    for (uint32_t word = 0; word < sx_div_round_up(count, 64); word++) {
+        uint64_t bits = exception_bits[word];
+        while (bits != 0) {
+            uint32_t position = word * 64u + sx_trailing_zeros_u64(bits);
+            exception_positions[exception_count] = (uint16_t)position;
+            digits[position] = base;
+            exception_count++;
+            bits &= bits - 1u;
+        }
     }
-
-    uint64_t offsets[SX_VECTOR_SIZE];
-    for (uint32_t i = 0; i < count; i++) {
-        offsets[i] = (uint64_t)digits[i] - (uint64_t)min_digits;
-    }
-    uint32_t width = sx_bit_width_u64((uint64_t)max_digits - (uint64_t)min_digits);
 
     sx_writer_put_u8(out, (uint8_t)exponent);
     sx_writer_put_u8(out, (uint8_t)factor);
     sx_writer_put_u16(out, (uint16_t)exception_count);
     sx_writer_reserve_zeroed(out, ALP_HEADER_PAD_1);
-    sx_writer_put_i64(out, min_digits);
+    sx_writer_put_i64(out, base);
     sx_writer_put_u8(out, (uint8_t)width);
     sx_writer_reserve_zeroed(out, ALP_HEADER_PAD_2);
-    write_packed(out, offsets, count, width);
+    uint8_t* packed = sx_writer_reserve(out, sx_bitpack_size(count, width));
+    if (packed != NULL) {
+        kernels->bitpack((const uint64_t*)digits, count, width, (uint64_t)base, packed);
+    }
 
     sx_writer_put_bytes(out, exception_positions, (size_t)exception_count * sizeof(uint16_t));
     sx_writer_pad_to(out, 8);
@@ -536,7 +525,8 @@ static void choose_parameters(sx_double_encoder* encoder, const sample* sampled,
         bool data_changed =
             alp->sample_exceptions > encoder->search_exceptions + ALP_CHANGE_EXCEPTIONS;
         if (!data_changed) {
-            *rd = estimate_rd(sampled, count, encoder->rd_right_width);
+            *rd = estimate_rd_unless_worse(sampled, count, encoder->rd_right_width,
+                                           alp->estimated_bits);
             encoder->chunks_until_search--;
             return;
         }
@@ -649,14 +639,15 @@ static bool decode_alp(sx_byte_reader* in, uint32_t count, double* out) {
         return false;
     }
 
-    uint64_t offsets[SX_VECTOR_SIZE];
-    if (!read_packed(in, count, width, offsets)) {
+    if (width > 64) {
         return false;
     }
-    for (uint32_t i = 0; i < count; i++) {
-        int64_t digits = (int64_t)(base + offsets[i]);
-        out[i] = alp_decode_value(digits, exponent, factor);
+    const uint8_t* packed = sx_reader_take(in, sx_bitpack_size(count, width));
+    if (packed == NULL) {
+        return false;
     }
+    sx_alp_scales scales = alp_scales(exponent, factor);
+    sx_codec_kernels_active()->decode_alp(packed, count, width, base, &scales, out);
 
     const uint8_t* positions = sx_reader_take(in, (size_t)exception_count * sizeof(uint16_t));
     sx_reader_skip_to(in, 8);

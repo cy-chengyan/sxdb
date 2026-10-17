@@ -40,6 +40,7 @@ jobs:
           - { os: ubuntu-24.04, cc: clang, variant: release }
           - { os: ubuntu-24.04-arm, cc: gcc, variant: release }
           - { os: ubuntu-24.04, cc: gcc, variant: c23 }
+          - { os: ubuntu-24.04, cc: gcc, variant: simd-off }
           - { os: ubuntu-24.04, cc: clang, variant: asan-ubsan }
           - { os: ubuntu-24.04, cc: clang, variant: tsan }
           - { os: macos-15, cc: clang, variant: release }
@@ -53,6 +54,7 @@ jobs:
           case "${{ matrix.variant }}" in
             release)    extra="-DCMAKE_BUILD_TYPE=Release" ;;
             c23)        extra="-DCMAKE_BUILD_TYPE=Release -DCMAKE_C_STANDARD=23" ;;
+            simd-off)   extra="-DCMAKE_BUILD_TYPE=Release -DSXDB_SIMD=OFF" ;;
             asan-ubsan) extra="-DCMAKE_BUILD_TYPE=Debug -DSXDB_SANITIZE=address,undefined" ;;
             tsan)       extra="-DCMAKE_BUILD_TYPE=Debug -DSXDB_SANITIZE=thread" ;;
           esac

@@ -17,17 +17,22 @@
 #include <stdint.h>
 #include <string.h>
 
-/* Number of bits needed to represent x; 0 for x == 0. */
+/*
+ * Number of bits needed to represent x; 0 for x == 0. Branch-free, because codecs call it
+ * on data where zero and non-zero values alternate unpredictably.
+ */
 static inline uint32_t sx_bit_width_u64(uint64_t x) {
-    if (x == 0) {
-        return 0;
-    }
-    return 64u - (uint32_t)__builtin_clzll(x);
+    return 64u - (uint32_t)__builtin_clzll(x | 1u) - (uint32_t)(x == 0);
 }
 
 /* Number of trailing zero bits; x must not be 0. */
 static inline uint32_t sx_trailing_zeros_u64(uint64_t x) {
     return (uint32_t)__builtin_ctzll(x);
+}
+
+/* Number of set bits. */
+static inline uint32_t sx_popcount_u64(uint64_t x) {
+    return (uint32_t)__builtin_popcountll(x);
 }
 
 /* A mask with the lowest `width` bits set; width may be 0 to 64. */

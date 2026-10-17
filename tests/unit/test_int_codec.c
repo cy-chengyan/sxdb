@@ -338,6 +338,40 @@ static void test_random_payloads_never_crash(void) {
     }
 }
 
+/*
+ * The delta encodings store their deltas lane by lane (see bitpack.h), so every count
+ * gives a different split of the slots over the lanes and a different last row.
+ */
+static void test_delta_encodings_every_count(void) {
+    static const sx_encoding encodings[] = {SX_ENCODING_DELTA_FOR, SX_ENCODING_DELTA_PATCHED};
+    int64_t values[SX_VECTOR_SIZE];
+    sx_rng rng;
+    sx_rng_seed(&rng, 11);
+    int64_t value = BASE_TIME_NS;
+    for (uint32_t i = 0; i < SX_VECTOR_SIZE; i++) {
+        value += (int64_t)(1 + sx_rng_below(&rng, 500)) * NANOS_PER_MILLI;
+        if (sx_rng_below(&rng, 100) == 0) {
+            value += INT64_C(3600) * 1000 * NANOS_PER_MILLI; /* a gap for DELTA_PATCHED */
+        }
+        values[i] = value;
+    }
+    for (size_t e = 0; e < SX_ARRAY_SIZE(encodings); e++) {
+        for (uint32_t count = 2; count <= SX_VECTOR_SIZE; count++) {
+            uint8_t buffer[SX_VECTOR_SIZE * 16];
+            sx_byte_writer writer;
+            sx_writer_init(&writer, buffer, sizeof(buffer));
+            sx_err err = sx_int64_encode_as(encodings[e], values, count, &writer);
+            if (err == SX_ERR_UNSUPPORTED) {
+                continue; /* DELTA_PATCHED applies only if it beats DELTA_FOR */
+            }
+            SX_CHECK(err == SX_OK);
+            int64_t decoded[SX_VECTOR_SIZE];
+            SX_CHECK(sx_int64_decode(encodings[e], buffer, writer.size, count, decoded) == SX_OK);
+            SX_CHECK_EQ_MEM(decoded, values, count * sizeof(int64_t));
+        }
+    }
+}
+
 static const sx_test_case cases[] = {
     {"constant", test_constant},
     {"regular_timestamps", test_regular_timestamps_use_delta_const},
@@ -353,6 +387,7 @@ static const sx_test_case cases[] = {
     {"common_multipliers", test_common_multipliers_round_trip},
     {"patched_corruption", test_patched_corruption_is_rejected},
     {"random_payloads", test_random_payloads_never_crash},
+    {"delta_encodings_every_count", test_delta_encodings_every_count},
 };
 
 const sx_test_suite sx_test_suite_int_codec = SX_TEST_SUITE("int_codec", cases);

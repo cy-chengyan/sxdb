@@ -30,6 +30,11 @@
  *                as DELTA_FOR, except that offset[exception_positions[j]] is
  *                exception_offsets[j] (its packed slot holds 0)
  *
+ * FOR_BITPACK packs its offsets in the interleaved order of bitpack.h. The delta
+ * encodings pack offset[i] in the lane-contiguous order (lane i / rows, row i % rows, with
+ * rows = ceil((count - 1) / 16)), so that the 16 lanes rebuild their values with
+ * independent prefix sums; the packed size is the same in both orders.
+ *
  * DELTA_PATCHED serves timestamps with a few large gaps, such as trading sessions with
  * a lunch break or overnight gaps: the regular steps are packed narrowly and the few
  * large ones are stored apart instead of widening every value.

@@ -42,6 +42,12 @@ size_t sx_os_page_size(void);
 /* True if the CPU has CRC32C instructions (SSE4.2 on x86_64, the CRC extension on ARM64). */
 bool sx_os_cpu_has_crc32c(void);
 
+/* True if the CPU and the operating system support AVX2 (x86_64 only). */
+bool sx_os_cpu_has_avx2(void);
+
+/* True if the CPU and the operating system support AVX-512 F and DQ (x86_64 only). */
+bool sx_os_cpu_has_avx512(void);
+
 /* Writes all `size` bytes to `fd`, retrying on short writes and interrupts. */
 sx_err sx_os_write_all(int fd, const void* data, size_t size);
 

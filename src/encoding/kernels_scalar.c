@@ -1,0 +1,133 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+
+/*
+ * Portable codec kernels: the reference implementation of kernels.h. They are written
+ * for clarity; the SIMD kernels must produce exactly the same output.
+ */
+
+#include "encoding/bitpack.h"
+#include "encoding/kernels.h"
+
+#include "common/bits.h"
+#include "common/compiler.h"
+
+#include <string.h>
+
+/* ORs `bits` into word `lane` of the row of words starting at `row_words`. */
+static void or_word(uint8_t* row_words, uint32_t lane, uint64_t bits) {
+    uint8_t* word = row_words + lane * sizeof(uint64_t);
+    sx_store_u64(word, sx_load_u64(word) | bits);
+}
+
+static void bitpack_scalar(const uint64_t* values, uint32_t count, uint32_t width, uint64_t base,
+                           uint8_t* out) {
+    memset(out, 0, sx_bitpack_size(count, width));
+    if (width == 0) {
+        return;
+    }
+    uint64_t mask = sx_low_mask_u64(width);
+    uint32_t rows = sx_bitpack_rows(count);
+    for (uint32_t row = 0; row < rows; row++) {
+        uint64_t bit_position = (uint64_t)row * width;
+        uint32_t offset = (uint32_t)(bit_position % 64u);
+        uint8_t* low_words = out + (bit_position / 64u) * SX_BITPACK_ROW_BYTES;
+        for (uint32_t lane = 0; lane < SX_BITPACK_LANES; lane++) {
+            uint32_t index = row * SX_BITPACK_LANES + lane;
+            uint64_t value = index < count ? (values[index] - base) & mask : 0;
+            or_word(low_words, lane, value << offset);
+            if (offset + width > 64u) {
+                /* The value continues in the next word of the lane. */
+                or_word(low_words + SX_BITPACK_ROW_BYTES, lane, value >> (64u - offset));
+            }
+        }
+    }
+}
+
+static void bitunpack_scalar(const uint8_t* packed, uint32_t count, uint32_t width, uint64_t* out) {
+    uint32_t rows = sx_bitpack_rows(count);
+    if (width == 0) {
+        memset(out, 0, (size_t)rows * SX_BITPACK_ROW_BYTES);
+        return;
+    }
+    uint64_t mask = sx_low_mask_u64(width);
+    for (uint32_t row = 0; row < rows; row++) {
+        uint64_t bit_position = (uint64_t)row * width;
+        uint32_t offset = (uint32_t)(bit_position % 64u);
+        const uint8_t* low_words = packed + (bit_position / 64u) * SX_BITPACK_ROW_BYTES;
+        uint64_t* dst = out + (size_t)row * SX_BITPACK_LANES;
+        for (uint32_t lane = 0; lane < SX_BITPACK_LANES; lane++) {
+            uint64_t value = sx_load_u64(low_words + lane * sizeof(uint64_t)) >> offset;
+            if (offset + width > 64u) {
+                const uint8_t* high = low_words + SX_BITPACK_ROW_BYTES + lane * sizeof(uint64_t);
+                value |= sx_load_u64(high) << (64u - offset);
+            }
+            dst[lane] = value & mask;
+        }
+    }
+}
+
+static void decode_for_scalar(const uint8_t* packed, uint32_t count, uint32_t width, uint64_t base,
+                              uint64_t multiplier, uint64_t* out) {
+    bitunpack_scalar(packed, count, width, out);
+    for (uint32_t i = 0; i < sx_bitpack_padded_count(count); i++) {
+        out[i] = base + out[i] * multiplier;
+    }
+}
+
+static void decode_alp_scalar(const uint8_t* packed, uint32_t count, uint32_t width, uint64_t base,
+                              const sx_alp_scales* scales, double* out) {
+    uint64_t offsets[SX_VECTOR_SIZE];
+    bitunpack_scalar(packed, count, width, offsets);
+    for (uint32_t i = 0; i < sx_bitpack_padded_count(count); i++) {
+        out[i] = sx_alp_decode(base + offsets[i], scales);
+    }
+}
+
+static void rebuild_deltas_scalar(const uint64_t* deltas, uint32_t slot_count, uint64_t first,
+                                  uint64_t* out) {
+    uint32_t rows = sx_bitpack_rows(slot_count);
+    uint64_t value = first;
+    out[0] = value;
+    /* Slots in order: lane by lane, and down the rows within a lane. */
+    uint32_t slot = 0;
+    for (uint32_t lane = 0; lane < SX_BITPACK_LANES && slot < slot_count; lane++) {
+        for (uint32_t row = 0; row < rows && slot < slot_count; row++) {
+            value += deltas[(size_t)row * SX_BITPACK_LANES + lane];
+            slot++;
+            out[slot] = value;
+        }
+    }
+}
+
+static uint32_t encode_alp_scalar(const double* values, uint32_t count, const sx_alp_scales* scales,
+                                  int64_t* digits, uint64_t* exception_bits,
+                                  sx_alp_digit_range* range) {
+    memset(exception_bits, 0, sx_div_round_up(count, 64) * sizeof(uint64_t));
+    range->min = INT64_MAX;
+    range->max = INT64_MIN;
+    uint32_t exceptions = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (!sx_alp_encode_value(values[i], scales, &digits[i])) {
+            exception_bits[i / 64u] |= UINT64_C(1) << (i % 64u);
+            exceptions++;
+            continue;
+        }
+        if (digits[i] < range->min) {
+            range->min = digits[i];
+        }
+        if (digits[i] > range->max) {
+            range->max = digits[i];
+        }
+    }
+    return exceptions;
+}
+
+const sx_codec_kernels sx_kernels_scalar = {
+    .level = SX_SIMD_SCALAR,
+    .bitpack = bitpack_scalar,
+    .bitunpack = bitunpack_scalar,
+    .decode_for = decode_for_scalar,
+    .decode_alp = decode_alp_scalar,
+    .rebuild_deltas = rebuild_deltas_scalar,
+    .encode_alp = encode_alp_scalar,
+};

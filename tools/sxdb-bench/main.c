@@ -13,6 +13,8 @@
  *   --values N        values per synthetic dataset (default 1048576)
  *   --min-time S      minimum seconds to time each measurement (default 0.25)
  *   --threads N       encode and decode with N threads (default 1)
+ *   --simd LEVEL      codec kernels: scalar, avx2, avx512, or neon (default: the best the
+ *                     CPU supports)
  *
  * Synthetic datasets are cut into chunks of 1024 values. CSV input is cut the way the
  * storage engine cuts blocks: at most 1024 values, never across two files (series), and
@@ -34,6 +36,7 @@
 #include "encoding/encoding.h"
 #include "encoding/float_codec.h"
 #include "encoding/int_codec.h"
+#include "encoding/kernels.h"
 #include "encoding/string_codec.h"
 
 #include <pthread.h>
@@ -514,8 +517,13 @@ static bool run_dataset(const bench_dataset* dataset, const bench_options* optio
     return ok;
 }
 
+static void print_settings(const bench_options* options) {
+    printf("threads: %u, kernels: %s\n\n", options->threads,
+           sx_simd_level_name(sx_codec_kernels_active()->level));
+}
+
 static int run_datasets(const bench_options* options) {
-    printf("threads: %u\n\n", options->threads);
+    print_settings(options);
     print_header("dataset");
     bool ok = true;
     for (size_t i = 0; i < options->dataset_count; i++) {
@@ -556,7 +564,7 @@ static int run_csv(const bench_options* options) {
         return 1;
     }
     print_csv_summary(&data, seconds_since(load_start));
-    printf("threads: %u\n\n", options->threads);
+    print_settings(options);
     print_header("column");
 
     bool ok = true;
@@ -600,6 +608,8 @@ static void print_usage(void) {
            "  --values N      values per synthetic dataset (default %u)\n"
            "  --min-time S    minimum seconds per measurement (default %.2f)\n"
            "  --threads N     encode and decode with N threads (default 1)\n"
+           "  --simd LEVEL    codec kernels: scalar, avx2, avx512, or neon (default: the\n"
+           "                  best the CPU supports)\n"
            "\n"
            "CSV input: PATH is a file or a directory (every file in it). Each file is one\n"
            "series. TYPE is int64, double, bool, string, timestamp, or decimalN (N = 0..18\n"
@@ -648,6 +658,17 @@ static int parse_arguments(int argc, char** argv, bench_options* options) {
                 return 2;
             }
             options->threads = (unsigned)value;
+        } else if (strcmp(arg, "--simd") == 0 && has_value) {
+            sx_simd_level level;
+            const char* name = argv[++i];
+            if (!sx_simd_level_from_name(name, &level)) {
+                fprintf(stderr, "error: unknown kernel set %s\n", name);
+                return 2;
+            }
+            if (!sx_simd_set_level(level)) {
+                fprintf(stderr, "error: kernel set %s is not supported on this machine\n", name);
+                return 2;
+            }
         } else if (strcmp(arg, "--csv") == 0) {
             in_csv_paths = true;
         } else if (strcmp(arg, "--columns") == 0 && has_value) {

@@ -7,9 +7,12 @@
  * ALP (Afroozeh, Kuffo, Boncz, SIGMOD 2024) targets doubles that originate from decimal
  * numbers, such as prices and sensor readings. Each value v is turned into an integer
  * d = round(v * 10^e * 10^-f) for an exponent e and factor f chosen per chunk, and is
- * kept only if d * 10^f * 10^-e reproduces v bit for bit. Values that do not survive the
- * round trip (NaN, infinities, -0.0, too many digits) are stored verbatim as exceptions.
- * The integers are then stored with frame-of-reference bit-packing.
+ * kept only if |v * 10^e * 10^-f| < 2^51 and d * 10^f * 10^-e reproduces v bit for bit.
+ * Values that do not survive the round trip (NaN, infinities, -0.0, too many digits) are
+ * stored verbatim as exceptions. The integers are then stored with frame-of-reference
+ * bit-packing (interleaved order). The decoder converts d to a double with the
+ * 2^52 + 2^51 identity of kernels.h, which is exact in that range, and multiplies
+ * left to right: (d * 10^f) * 10^-e.
  *
  * ALP_RD targets doubles with many significant digits. It splits each value's 64 bits
  * into a high "left" part (at most 16 bits), which usually takes very few distinct

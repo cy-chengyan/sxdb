@@ -3,11 +3,15 @@
 /*
  * Unit test runner.
  *
- * Usage: sxdb-unit-tests [suite ...]
- * With no arguments every suite runs. Exit status is 0 only if every test passed.
+ * Usage: sxdb-unit-tests [--simd LEVEL] [suite ...]
+ * With no suites every suite runs. --simd runs the codecs with one kernel set (scalar,
+ * avx2, avx512, neon); exit status 77 means the machine does not support it. Otherwise
+ * the exit status is 0 only if every test passed.
  */
 
 #include "sx_test.h"
+
+#include "encoding/kernels.h"
 
 #include <ftw.h>
 #include <stdarg.h>
@@ -23,6 +27,7 @@ extern const sx_test_suite sx_test_suite_bitpack;
 extern const sx_test_suite sx_test_suite_int_codec;
 extern const sx_test_suite sx_test_suite_float_codec;
 extern const sx_test_suite sx_test_suite_bool_string_codec;
+extern const sx_test_suite sx_test_suite_codec_kernels;
 
 static const sx_test_suite* const all_suites[] = {
     &sx_test_suite_common,
@@ -32,6 +37,7 @@ static const sx_test_suite* const all_suites[] = {
     &sx_test_suite_int_codec,
     &sx_test_suite_float_codec,
     &sx_test_suite_bool_string_codec,
+    &sx_test_suite_codec_kernels,
 };
 
 static const size_t all_suite_count = sizeof(all_suites) / sizeof(all_suites[0]);
@@ -107,14 +113,30 @@ static const sx_test_suite* find_suite(const char* name) {
     return NULL;
 }
 
+/* Exit status that CTest reports as a skipped test (SKIP_RETURN_CODE). */
+#define EXIT_SKIPPED 77
+
 int main(int argc, char** argv) {
+    int first_suite = 1;
+    if (argc >= 3 && strcmp(argv[1], "--simd") == 0) {
+        sx_simd_level level;
+        if (!sx_simd_level_from_name(argv[2], &level)) {
+            fprintf(stderr, "unknown kernel set: %s\n", argv[2]);
+            return 2;
+        }
+        if (!sx_simd_set_level(level)) {
+            printf("kernel set %s is not supported here; skipping\n", argv[2]);
+            return EXIT_SKIPPED;
+        }
+        first_suite = 3;
+    }
     size_t failed = 0;
-    if (argc <= 1) {
+    if (argc <= first_suite) {
         for (size_t i = 0; i < all_suite_count; i++) {
             failed += run_suite(all_suites[i]);
         }
     } else {
-        for (int i = 1; i < argc; i++) {
+        for (int i = first_suite; i < argc; i++) {
             const sx_test_suite* suite = find_suite(argv[i]);
             if (suite == NULL) {
                 fprintf(stderr, "unknown test suite: %s\n", argv[i]);

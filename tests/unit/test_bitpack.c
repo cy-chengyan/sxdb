@@ -68,10 +68,38 @@ static void test_values_are_masked_to_width(void) {
     }
 }
 
+/* Value i of the lane-contiguous order sits in lane i / rows, row i % rows. */
+static void test_lane_order(void) {
+    uint64_t values[SX_VECTOR_SIZE];
+    uint64_t ordered[SX_VECTOR_SIZE];
+    for (uint32_t i = 0; i < SX_VECTOR_SIZE; i++) {
+        values[i] = i + 1u;
+    }
+    for (uint32_t count = 1; count <= SX_VECTOR_SIZE; count++) {
+        uint32_t rows = sx_bitpack_rows(count);
+        memset(ordered, 0xFF, sizeof(ordered));
+        sx_bitpack_to_lane_order(values, count, ordered);
+        uint32_t found = 0;
+        for (uint32_t position = 0; position < sx_bitpack_padded_count(count); position++) {
+            uint32_t lane = position % SX_BITPACK_LANES;
+            uint32_t row = position / SX_BITPACK_LANES;
+            uint32_t index = lane * rows + row;
+            uint64_t expected = index < count ? values[index] : 0;
+            SX_CHECK_EQ_U64(ordered[position], expected);
+            if (index < count) {
+                SX_CHECK_EQ_U64(sx_bitpack_lane_position(index, rows), position);
+                found++;
+            }
+        }
+        SX_CHECK_EQ_U64(found, count);
+    }
+}
+
 static const sx_test_case cases[] = {
     {"packed_sizes", test_packed_sizes},
     {"round_trip_widths_counts", test_round_trip_every_width_and_count},
     {"values_masked_to_width", test_values_are_masked_to_width},
+    {"lane_order", test_lane_order},
 };
 
 const sx_test_suite sx_test_suite_bitpack = SX_TEST_SUITE("bitpack", cases);

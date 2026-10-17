@@ -33,6 +33,7 @@ Useful options:
 | `-DSXDB_SANITIZE=address,undefined` | Build with AddressSanitizer and UndefinedBehaviorSanitizer (use with `-DCMAKE_BUILD_TYPE=Debug`) |
 | `-DSXDB_SANITIZE=thread` | Build with ThreadSanitizer |
 | `-DSXDB_WERROR=ON` | Treat compiler warnings as errors (always on in CI) |
+| `-DSXDB_SIMD=OFF` | Build only the portable codec kernels, without the AVX2, AVX-512, and NEON ones (by default the best set the CPU supports is chosen at run time) |
 
 `scripts/check-source.sh` checks the source rules (ASCII only, banned functions, license headers, layering). Formatting follows `.clang-format` and is checked in CI with clang-format 22.1.8; other releases format some constructs differently, so use the same version (`pipx install clang-format==22.1.8`).
 
@@ -46,7 +47,7 @@ build/tools/sxdb-bench/sxdb-bench --list          # list the datasets
 build/tools/sxdb-bench/sxdb-bench --csv bars/ --columns 2:timestamp,3:decimal2,7:decimal0 --split-on 9
 ```
 
-The `--csv` form measures columns of your own data. Each path is a CSV file or a directory of them, and every file is treated as one series. Column types are `int64`, `double`, `bool`, `string`, `timestamp`, and `decimalN` (N fraction digits). `--split-on FIELD` starts a new chunk whenever that field changes, which mimics a partition such as one trading day. `--threads N` measures with N threads. Run `sxdb-bench --help` for all options.
+The `--csv` form measures columns of your own data. Each path is a CSV file or a directory of them, and every file is treated as one series. Column types are `int64`, `double`, `bool`, `string`, `timestamp`, and `decimalN` (N fraction digits). `--split-on FIELD` starts a new chunk whenever that field changes, which mimics a partition such as one trading day. `--threads N` measures with N threads. `--simd LEVEL` measures one codec kernel set (`scalar`, `avx2`, `avx512`, or `neon`) instead of the best one the CPU supports. Run `sxdb-bench --help` for all options.
 
 ## Documentation
 

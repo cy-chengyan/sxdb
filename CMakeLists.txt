@@ -19,6 +19,7 @@ endif()
 option(SXDB_BUILD_TESTS "Build the unit tests" ON)
 option(SXDB_BUILD_TOOLS "Build the command-line tools" ON)
 option(SXDB_WERROR "Treat compiler warnings as errors" OFF)
+option(SXDB_SIMD "Build the AVX2, AVX-512, and NEON codec kernels" ON)
 set(SXDB_SANITIZE "" CACHE STRING
     "Comma-separated sanitizers to enable, for example address,undefined or thread")
 

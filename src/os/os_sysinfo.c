@@ -135,3 +135,23 @@ bool sx_os_cpu_has_crc32c(void) {
     return false;
 #endif
 }
+
+/*
+ * __builtin_cpu_supports also checks (with XGETBV) that the operating system saves the
+ * vector registers, so a true result means the instructions can be used.
+ */
+bool sx_os_cpu_has_avx2(void) {
+#if defined(SX_ARCH_X86_64)
+    return __builtin_cpu_supports("avx2");
+#else
+    return false;
+#endif
+}
+
+bool sx_os_cpu_has_avx512(void) {
+#if defined(SX_ARCH_X86_64)
+    return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512dq");
+#else
+    return false;
+#endif
+}
