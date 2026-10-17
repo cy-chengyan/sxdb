@@ -2,7 +2,7 @@
 
 /*
  * An in-memory column of benchmark input: one of 64-bit integers, doubles, booleans, or
- * strings (Arrow layout: offsets plus bytes).
+ * strings (Arrow layout: offsets plus bytes), with optional NULL flags.
  */
 
 #ifndef SXDB_BENCH_COLUMN_H
@@ -21,21 +21,29 @@ typedef enum bench_type {
 
 typedef struct bench_column {
     bench_type type;
-    uint32_t count;
+    uint32_t count;    /* values stored */
+    uint32_t capacity; /* values allocated */
     int64_t* ints;
     double* doubles;
     uint8_t* bools;
-    uint32_t* offsets;    /* count + 1 entries */
+    uint32_t* offsets;    /* capacity + 1 entries */
     uint8_t* string_data; /* string bytes */
     size_t string_capacity;
+    uint8_t* nulls; /* 1 where the input was NULL; allocated on the first NULL */
+    uint64_t null_count;
 } bench_column;
 
-/* Allocates storage for `count` values. Strings start with `string_capacity` bytes. */
-bool bench_column_init(bench_column* column, bench_type type, uint32_t count,
-                       size_t string_capacity);
+/* Allocates room for `capacity` values; the column starts empty. */
+bool bench_column_init(bench_column* column, bench_type type, uint32_t capacity);
 
-/* Appends one string, growing the byte buffer as needed. Used while generating. */
+/* Grows the column so it can hold at least `capacity` values. */
+bool bench_column_reserve(bench_column* column, uint32_t capacity);
+
+/* Stores string `index`. Strings must be stored in index order. */
 bool bench_column_set_string(bench_column* column, uint32_t index, const char* text, size_t length);
+
+/* Records that value `index` was NULL in the input. */
+bool bench_column_mark_null(bench_column* column, uint32_t index);
 
 void bench_column_free(bench_column* column);
 

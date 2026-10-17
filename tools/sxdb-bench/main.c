@@ -2,22 +2,31 @@
 
 /*
  * sxdb-bench: measures the compression ratio and the encode and decode speed of the
- * column encodings, on built-in synthetic datasets or on one column of a CSV file.
+ * column encodings, on built-in synthetic datasets or on columns of real CSV data.
  *
  * Usage:
- *   sxdb-bench [--values N] [--min-time SECONDS] [DATASET ...]
- *   sxdb-bench --csv FILE --column N --type int64|double|bool|string [--skip-header]
+ *   sxdb-bench [options] [DATASET ...]
+ *   sxdb-bench [options] --csv PATH [PATH ...] --columns SPEC [--skip-header] [--split-on N]
  *   sxdb-bench --list
  *
- * Every dataset is split into chunks of 1024 values, as the storage engine does. The
- * first decode pass is checked against the input, so a wrong codec cannot report a
+ * Options:
+ *   --values N        values per synthetic dataset (default 1048576)
+ *   --min-time S      minimum seconds to time each measurement (default 0.25)
+ *   --threads N       encode and decode with N threads (default 1)
+ *
+ * Synthetic datasets are cut into chunks of 1024 values. CSV input is cut the way the
+ * storage engine cuts blocks: at most 1024 values, never across two files (series), and
+ * with --split-on never across a change of that field (a partition such as a day).
+ * The first decode pass is checked against the input, so a wrong codec cannot report a
  * result.
  */
 
+#include "chunks.h"
 #include "column.h"
 #include "csv.h"
 #include "datasets.h"
 
+#include "common/bits.h"
 #include "common/bytes.h"
 #include "common/clock.h"
 #include "common/compiler.h"
@@ -27,6 +36,7 @@
 #include "encoding/int_codec.h"
 #include "encoding/string_codec.h"
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,35 +44,32 @@
 #define ENCODING_ID_COUNT   11u
 #define DEFAULT_VALUE_COUNT (1u << 20)
 #define DEFAULT_MIN_SECONDS 0.25
+#define MAX_THREADS         256u
+#define MAX_DATASETS        64u
+#define MAX_CSV_PATHS       1024u
 
 typedef struct bench_options {
     uint32_t value_count;
     double min_seconds;
-    const char* csv_path;
-    unsigned csv_column;
-    bench_type csv_type;
-    bool csv_type_given;
-    bool skip_header;
+    unsigned threads;
+    const char* datasets[MAX_DATASETS];
+    size_t dataset_count;
+    char* csv_paths[MAX_CSV_PATHS];
+    size_t csv_path_count;
+    bool columns_given;
+    bench_csv_options csv;
 } bench_options;
 
-/* Every chunk of a column, encoded back to back. */
+/* Every chunk encoded into its own slot, sized for the worst case so that chunks can be
+ * encoded in parallel. */
 typedef struct encoded_column {
-    uint32_t chunk_count;
     uint8_t* data;
-    size_t capacity;
-    size_t* chunk_offsets; /* chunk_count + 1 entries */
+    size_t* slot_offsets;
+    size_t* sizes;
     sx_encoding* encodings;
 } encoded_column;
 
-typedef struct bench_result {
-    uint64_t raw_bytes;
-    uint64_t encoded_bytes;
-    double encode_seconds;
-    double decode_seconds;
-    uint32_t encoding_counts[ENCODING_ID_COUNT];
-} bench_result;
-
-/* Decode output buffers for one chunk. */
+/* Decode output buffers for one chunk; one set per thread. */
 typedef struct decode_buffers {
     int64_t ints[SX_VECTOR_SIZE];
     double doubles[SX_VECTOR_SIZE];
@@ -72,23 +79,29 @@ typedef struct decode_buffers {
     size_t string_capacity;
 } decode_buffers;
 
+/* One column being measured. */
+typedef struct bench_job {
+    const bench_column* column;
+    const bench_chunks* chunks;
+    encoded_column encoded;
+    decode_buffers* buffers[MAX_THREADS];
+    unsigned threads;
+} bench_job;
+
+typedef struct bench_result {
+    uint64_t raw_bytes;
+    uint64_t encoded_bytes; /* payloads plus NULL bitmaps */
+    uint64_t null_bitmap_bytes;
+    double encode_seconds; /* per pass over the whole column */
+    double decode_seconds;
+    uint32_t encoding_counts[ENCODING_ID_COUNT];
+} bench_result;
+
 /* ---------------------------------------------------------------------------------------- */
-/* Chunking                                                                                 */
+/* Encoding and decoding one chunk                                                          */
 /* ---------------------------------------------------------------------------------------- */
 
-static uint32_t chunk_start(uint32_t chunk) {
-    return chunk * SX_VECTOR_SIZE;
-}
-
-static uint32_t chunk_size(const bench_column* column, uint32_t chunk) {
-    uint32_t start = chunk_start(chunk);
-    uint32_t remaining = column->count - start;
-    return remaining < SX_VECTOR_SIZE ? remaining : SX_VECTOR_SIZE;
-}
-
-static size_t chunk_bound(const bench_column* column, uint32_t chunk) {
-    uint32_t start = chunk_start(chunk);
-    uint32_t count = chunk_size(column, chunk);
+static size_t chunk_bound(const bench_column* column, uint32_t start, uint32_t count) {
     switch (column->type) {
         case BENCH_TYPE_INT64:
             return sx_int64_encode_bound(count);
@@ -102,32 +115,8 @@ static size_t chunk_bound(const bench_column* column, uint32_t chunk) {
     return 0;
 }
 
-static bool encoded_column_init(encoded_column* encoded, const bench_column* column) {
-    memset(encoded, 0, sizeof(*encoded));
-    encoded->chunk_count = (column->count + SX_VECTOR_SIZE - 1u) / SX_VECTOR_SIZE;
-    for (uint32_t chunk = 0; chunk < encoded->chunk_count; chunk++) {
-        encoded->capacity += chunk_bound(column, chunk);
-    }
-    encoded->data = malloc(encoded->capacity);
-    encoded->chunk_offsets = calloc((size_t)encoded->chunk_count + 1u, sizeof(size_t));
-    encoded->encodings = calloc(encoded->chunk_count, sizeof(sx_encoding));
-    return encoded->data != NULL && encoded->chunk_offsets != NULL && encoded->encodings != NULL;
-}
-
-static void encoded_column_free(encoded_column* encoded) {
-    free(encoded->data);
-    free(encoded->chunk_offsets);
-    free(encoded->encodings);
-}
-
-/* ---------------------------------------------------------------------------------------- */
-/* Encode and decode passes                                                                 */
-/* ---------------------------------------------------------------------------------------- */
-
-static sx_err encode_chunk(const bench_column* column, uint32_t chunk, sx_byte_writer* writer,
-                           sx_encoding* encoding) {
-    uint32_t start = chunk_start(chunk);
-    uint32_t count = chunk_size(column, chunk);
+static sx_err encode_chunk(const bench_column* column, uint32_t start, uint32_t count,
+                           sx_byte_writer* writer, sx_encoding* encoding) {
     switch (column->type) {
         case BENCH_TYPE_INT64:
             return sx_int64_encode(column->ints + start, count, writer, encoding);
@@ -142,27 +131,28 @@ static sx_err encode_chunk(const bench_column* column, uint32_t chunk, sx_byte_w
     return SX_ERR_UNSUPPORTED;
 }
 
-static bool encode_pass(const bench_column* column, encoded_column* encoded) {
-    size_t offset = 0;
-    for (uint32_t chunk = 0; chunk < encoded->chunk_count; chunk++) {
-        sx_byte_writer writer;
-        sx_writer_init(&writer, encoded->data + offset, chunk_bound(column, chunk));
-        if (encode_chunk(column, chunk, &writer, &encoded->encodings[chunk]) != SX_OK) {
-            fprintf(stderr, "error: encoding chunk %u failed\n", chunk);
-            return false;
-        }
-        encoded->chunk_offsets[chunk] = offset;
-        offset += writer.size;
+static sx_err decode_chunk(const bench_job* job, uint32_t chunk, decode_buffers* buffers) {
+    const uint8_t* payload = job->encoded.data + job->encoded.slot_offsets[chunk];
+    size_t size = job->encoded.sizes[chunk];
+    sx_encoding encoding = job->encoded.encodings[chunk];
+    uint32_t count = job->chunks->counts[chunk];
+    switch (job->column->type) {
+        case BENCH_TYPE_INT64:
+            return sx_int64_decode(encoding, payload, size, count, buffers->ints);
+        case BENCH_TYPE_DOUBLE:
+            return sx_double_decode(encoding, payload, size, count, buffers->doubles);
+        case BENCH_TYPE_BOOL:
+            return sx_bool_decode(encoding, payload, size, count, buffers->bools);
+        case BENCH_TYPE_STRING:
+            return sx_string_decode(encoding, payload, size, count, buffers->offsets,
+                                    buffers->string_data, buffers->string_capacity);
     }
-    encoded->chunk_offsets[encoded->chunk_count] = offset;
-    return true;
+    return SX_ERR_UNSUPPORTED;
 }
 
 /* Compares a decoded chunk with the input. */
-static bool chunk_matches(const bench_column* column, uint32_t chunk,
+static bool chunk_matches(const bench_column* column, uint32_t start, uint32_t count,
                           const decode_buffers* buffers) {
-    uint32_t start = chunk_start(chunk);
-    uint32_t count = chunk_size(column, chunk);
     switch (column->type) {
         case BENCH_TYPE_INT64:
             return memcmp(buffers->ints, column->ints + start, count * sizeof(int64_t)) == 0;
@@ -189,35 +179,37 @@ static bool chunk_matches(const bench_column* column, uint32_t chunk,
     return false;
 }
 
-static sx_err decode_chunk(const bench_column* column, const encoded_column* encoded,
-                           uint32_t chunk, decode_buffers* buffers) {
-    const uint8_t* payload = encoded->data + encoded->chunk_offsets[chunk];
-    size_t size = encoded->chunk_offsets[chunk + 1] - encoded->chunk_offsets[chunk];
-    sx_encoding encoding = encoded->encodings[chunk];
-    uint32_t count = chunk_size(column, chunk);
-    switch (column->type) {
-        case BENCH_TYPE_INT64:
-            return sx_int64_decode(encoding, payload, size, count, buffers->ints);
-        case BENCH_TYPE_DOUBLE:
-            return sx_double_decode(encoding, payload, size, count, buffers->doubles);
-        case BENCH_TYPE_BOOL:
-            return sx_bool_decode(encoding, payload, size, count, buffers->bools);
-        case BENCH_TYPE_STRING:
-            return sx_string_decode(encoding, payload, size, count, buffers->offsets,
-                                    buffers->string_data, buffers->string_capacity);
+/* ---------------------------------------------------------------------------------------- */
+/* Passes over a range of chunks, optionally on several threads                             */
+/* ---------------------------------------------------------------------------------------- */
+
+static bool encode_range(bench_job* job, uint32_t first, uint32_t end) {
+    for (uint32_t chunk = first; chunk < end; chunk++) {
+        uint32_t start = job->chunks->starts[chunk];
+        uint32_t count = job->chunks->counts[chunk];
+        sx_byte_writer writer;
+        sx_writer_init(&writer, job->encoded.data + job->encoded.slot_offsets[chunk],
+                       chunk_bound(job->column, start, count));
+        if (encode_chunk(job->column, start, count, &writer, &job->encoded.encodings[chunk]) !=
+            SX_OK) {
+            fprintf(stderr, "error: encoding chunk %u failed\n", chunk);
+            return false;
+        }
+        job->encoded.sizes[chunk] = writer.size;
     }
-    return SX_ERR_UNSUPPORTED;
+    return true;
 }
 
-static bool decode_pass(const bench_column* column, const encoded_column* encoded,
-                        decode_buffers* buffers, bool verify) {
-    for (uint32_t chunk = 0; chunk < encoded->chunk_count; chunk++) {
-        sx_err err = decode_chunk(column, encoded, chunk, buffers);
+static bool decode_range(bench_job* job, uint32_t first, uint32_t end, decode_buffers* buffers,
+                         bool verify) {
+    for (uint32_t chunk = first; chunk < end; chunk++) {
+        sx_err err = decode_chunk(job, chunk, buffers);
         if (err != SX_OK) {
             fprintf(stderr, "error: decoding chunk %u failed: %s\n", chunk, sx_err_str(err));
             return false;
         }
-        if (verify && !chunk_matches(column, chunk, buffers)) {
+        if (verify && !chunk_matches(job->column, job->chunks->starts[chunk],
+                                     job->chunks->counts[chunk], buffers)) {
             fprintf(stderr, "error: chunk %u does not round-trip\n", chunk);
             return false;
         }
@@ -225,73 +217,204 @@ static bool decode_pass(const bench_column* column, const encoded_column* encode
     return true;
 }
 
+typedef struct worker_task {
+    bench_job* job;
+    uint32_t first;
+    uint32_t end;
+    decode_buffers* buffers;
+    bool decode;
+    bool verify;
+    uint32_t passes;
+    bool ok;
+} worker_task;
+
+/* Processes the task's chunks `passes` times, so threads start once per measurement. */
+static void* worker_main(void* arg) {
+    worker_task* task = arg;
+    task->ok = true;
+    for (uint32_t pass = 0; pass < task->passes && task->ok; pass++) {
+        if (task->decode) {
+            task->ok = decode_range(task->job, task->first, task->end, task->buffers, task->verify);
+        } else {
+            task->ok = encode_range(task->job, task->first, task->end);
+        }
+    }
+    return NULL;
+}
+
+/* Runs `passes` encode or decode passes over every chunk, split evenly across the threads. */
+static bool run_passes(bench_job* job, bool decode, bool verify, uint32_t passes) {
+    uint32_t chunk_count = job->chunks->count;
+    unsigned threads = job->threads;
+    uint32_t per_thread = (chunk_count + threads - 1u) / threads;
+    worker_task tasks[MAX_THREADS];
+    pthread_t ids[MAX_THREADS];
+
+    for (unsigned t = 0; t < threads; t++) {
+        uint32_t first = t * per_thread < chunk_count ? t * per_thread : chunk_count;
+        uint32_t end = first + per_thread < chunk_count ? first + per_thread : chunk_count;
+        tasks[t] = (worker_task){
+            .job = job,
+            .first = first,
+            .end = end,
+            .buffers = job->buffers[t],
+            .decode = decode,
+            .verify = verify,
+            .passes = passes,
+        };
+    }
+    if (threads == 1) {
+        worker_main(&tasks[0]);
+        return tasks[0].ok;
+    }
+    for (unsigned t = 0; t < threads; t++) {
+        if (pthread_create(&ids[t], NULL, worker_main, &tasks[t]) != 0) {
+            fprintf(stderr, "error: cannot start thread %u\n", t);
+            for (unsigned started = 0; started < t; started++) {
+                pthread_join(ids[started], NULL);
+            }
+            return false;
+        }
+    }
+    bool ok = true;
+    for (unsigned t = 0; t < threads; t++) {
+        pthread_join(ids[t], NULL);
+        ok = ok && tasks[t].ok;
+    }
+    return ok;
+}
+
 static double seconds_since(uint64_t start_ns) {
     return (double)(sx_clock_monotonic_ns() - start_ns) / 1e9;
 }
 
-/* Runs one pass to warm up, then repeats until `min_seconds` have passed. */
-static bool time_encoding(const bench_column* column, encoded_column* encoded, double min_seconds,
-                          double* seconds_per_pass) {
-    if (!encode_pass(column, encoded)) {
+/*
+ * Runs one untimed pass (which verifies decoding) and one timed pass to estimate the
+ * cost, then times enough passes to fill `min_seconds` and reports the time of one pass.
+ */
+static bool time_passes(bench_job* job, bool decode, double min_seconds, double* seconds_per_pass) {
+    if (!run_passes(job, decode, decode, 1)) {
         return false;
     }
-    uint32_t passes = 0;
     uint64_t start = sx_clock_monotonic_ns();
-    do {
-        if (!encode_pass(column, encoded)) {
-            return false;
-        }
-        passes++;
-    } while (seconds_since(start) < min_seconds);
+    if (!run_passes(job, decode, false, 1)) {
+        return false;
+    }
+    double estimate = seconds_since(start);
+    uint32_t passes = 1;
+    if (estimate < min_seconds) {
+        double wanted = min_seconds / (estimate > 1e-6 ? estimate : 1e-6);
+        passes = wanted > 100000.0 ? 100000u : (uint32_t)wanted + 1u;
+    }
+    start = sx_clock_monotonic_ns();
+    if (!run_passes(job, decode, false, passes)) {
+        return false;
+    }
     *seconds_per_pass = seconds_since(start) / passes;
     return true;
 }
 
-static bool time_decoding(const bench_column* column, const encoded_column* encoded,
-                          decode_buffers* buffers, double min_seconds, double* seconds_per_pass) {
-    if (!decode_pass(column, encoded, buffers, true)) {
+/* ---------------------------------------------------------------------------------------- */
+/* Setting up and running one column                                                        */
+/* ---------------------------------------------------------------------------------------- */
+
+static bool job_init(bench_job* job, const bench_column* column, const bench_chunks* chunks,
+                     unsigned threads) {
+    memset(job, 0, sizeof(*job));
+    job->column = column;
+    job->chunks = chunks;
+    job->threads = threads;
+
+    encoded_column* encoded = &job->encoded;
+    encoded->slot_offsets = calloc(chunks->count, sizeof(size_t));
+    encoded->sizes = calloc(chunks->count, sizeof(size_t));
+    encoded->encodings = calloc(chunks->count, sizeof(sx_encoding));
+    if (encoded->slot_offsets == NULL || encoded->sizes == NULL || encoded->encodings == NULL) {
         return false;
     }
-    uint32_t passes = 0;
-    uint64_t start = sx_clock_monotonic_ns();
-    do {
-        if (!decode_pass(column, encoded, buffers, false)) {
+
+    size_t capacity = 0;
+    size_t max_string_bytes = 1;
+    for (uint32_t chunk = 0; chunk < chunks->count; chunk++) {
+        uint32_t start = chunks->starts[chunk];
+        uint32_t count = chunks->counts[chunk];
+        encoded->slot_offsets[chunk] = capacity;
+        capacity += sx_align_up(chunk_bound(column, start, count), 8);
+        if (column->type == BENCH_TYPE_STRING) {
+            size_t bytes = column->offsets[start + count] - column->offsets[start];
+            max_string_bytes = bytes > max_string_bytes ? bytes : max_string_bytes;
+        }
+    }
+    encoded->data = malloc(capacity > 0 ? capacity : 1);
+    if (encoded->data == NULL) {
+        return false;
+    }
+
+    for (unsigned t = 0; t < threads; t++) {
+        job->buffers[t] = calloc(1, sizeof(decode_buffers));
+        if (job->buffers[t] == NULL) {
             return false;
         }
-        passes++;
-    } while (seconds_since(start) < min_seconds);
-    *seconds_per_pass = seconds_since(start) / passes;
+        if (column->type == BENCH_TYPE_STRING) {
+            job->buffers[t]->string_capacity = max_string_bytes;
+            job->buffers[t]->string_data = malloc(max_string_bytes);
+            if (job->buffers[t]->string_data == NULL) {
+                return false;
+            }
+        }
+    }
     return true;
 }
 
-static bool run_benchmark(const bench_column* column, double min_seconds, bench_result* result) {
+static void job_free(bench_job* job) {
+    free(job->encoded.data);
+    free(job->encoded.slot_offsets);
+    free(job->encoded.sizes);
+    free(job->encoded.encodings);
+    for (unsigned t = 0; t < job->threads; t++) {
+        if (job->buffers[t] != NULL) {
+            free(job->buffers[t]->string_data);
+            free(job->buffers[t]);
+        }
+    }
+}
+
+/* Bytes the storage engine needs for NULL bitmaps: one per chunk that contains a NULL. */
+static uint64_t null_bitmap_bytes(const bench_column* column, const bench_chunks* chunks) {
+    if (column->nulls == NULL) {
+        return 0;
+    }
+    uint64_t bytes = 0;
+    for (uint32_t chunk = 0; chunk < chunks->count; chunk++) {
+        uint32_t start = chunks->starts[chunk];
+        uint32_t count = chunks->counts[chunk];
+        for (uint32_t i = 0; i < count; i++) {
+            if (column->nulls[start + i]) {
+                bytes += sx_div_round_up(count, 64) * 8u;
+                break;
+            }
+        }
+    }
+    return bytes;
+}
+
+static bool run_benchmark(const bench_column* column, const bench_chunks* chunks,
+                          const bench_options* options, bench_result* result) {
     memset(result, 0, sizeof(*result));
-    /* Zeroed first: the cleanup below runs even if an allocation fails before init. */
-    encoded_column encoded = {0};
-    decode_buffers* buffers = calloc(1, sizeof(*buffers));
-    bool ok = buffers != NULL && encoded_column_init(&encoded, column);
-    if (ok && column->type == BENCH_TYPE_STRING) {
-        /* Enough for the largest chunk of string data. */
-        buffers->string_capacity = column->offsets[column->count] + 1u;
-        buffers->string_data = malloc(buffers->string_capacity);
-        ok = buffers->string_data != NULL;
-    }
-
-    ok = ok && time_encoding(column, &encoded, min_seconds, &result->encode_seconds);
-    ok = ok && time_decoding(column, &encoded, buffers, min_seconds, &result->decode_seconds);
+    bench_job job;
+    bool ok = job_init(&job, column, chunks, options->threads);
+    ok = ok && time_passes(&job, false, options->min_seconds, &result->encode_seconds);
+    ok = ok && time_passes(&job, true, options->min_seconds, &result->decode_seconds);
     if (ok) {
         result->raw_bytes = bench_column_raw_bytes(column);
-        result->encoded_bytes = encoded.chunk_offsets[encoded.chunk_count];
-        for (uint32_t chunk = 0; chunk < encoded.chunk_count; chunk++) {
-            result->encoding_counts[encoded.encodings[chunk]]++;
+        result->null_bitmap_bytes = null_bitmap_bytes(column, chunks);
+        result->encoded_bytes = result->null_bitmap_bytes;
+        for (uint32_t chunk = 0; chunk < chunks->count; chunk++) {
+            result->encoded_bytes += job.encoded.sizes[chunk];
+            result->encoding_counts[job.encoded.encodings[chunk]]++;
         }
     }
-
-    encoded_column_free(&encoded);
-    if (buffers != NULL) {
-        free(buffers->string_data);
-        free(buffers);
-    }
+    job_free(&job);
     return ok;
 }
 
@@ -299,15 +422,17 @@ static bool run_benchmark(const bench_column* column, double min_seconds, bench_
 /* Reporting                                                                                */
 /* ---------------------------------------------------------------------------------------- */
 
-static void print_header(void) {
-    printf("%-18s %-7s %9s %9s %8s %10s %10s %10s  %s\n", "dataset", "type", "values", "bytes/val",
-           "ratio", "enc MB/s", "dec MB/s", "dec Mval/s", "encodings");
-    printf("%-18s %-7s %9s %9s %8s %10s %10s %10s  %s\n", "-------", "----", "------", "---------",
-           "-----", "--------", "--------", "----------", "---------");
+static void print_header(const char* first_column) {
+    printf("%-18s %-7s %10s %9s %8s %10s %10s %10s  %s\n", first_column, "type", "values",
+           "bytes/val", "ratio", "enc MB/s", "dec MB/s", "dec Mval/s", "encodings");
+    printf("%-18s %-7s %10s %9s %8s %10s %10s %10s  %s\n", "------------------", "-------",
+           "----------", "---------", "--------", "----------", "----------", "----------",
+           "---------");
 }
 
 /* Lists the encodings used, most frequent first, with their share of chunks. */
-static void format_encodings(const bench_result* result, uint32_t chunks, char* out, size_t size) {
+static void format_encodings(const bench_result* result, uint32_t chunk_count, char* out,
+                             size_t size) {
     bool used[ENCODING_ID_COUNT] = {false};
     size_t written = 0;
     out[0] = '\0';
@@ -323,7 +448,7 @@ static void format_encodings(const bench_result* result, uint32_t chunks, char* 
             return;
         }
         used[best] = true;
-        double share = 100.0 * result->encoding_counts[best] / chunks;
+        double share = 100.0 * result->encoding_counts[best] / chunk_count;
         int n = snprintf(out + written, size - written, "%s%s %.0f%%", written > 0 ? ", " : "",
                          sx_encoding_name((sx_encoding)best), share);
         if (n < 0) {
@@ -333,53 +458,23 @@ static void format_encodings(const bench_result* result, uint32_t chunks, char* 
     }
 }
 
-static void print_result(const char* name, const bench_column* column, const bench_result* result) {
-    uint32_t chunks = (column->count + SX_VECTOR_SIZE - 1u) / SX_VECTOR_SIZE;
+static void print_result(const char* name, const bench_column* column, uint32_t chunk_count,
+                         const bench_result* result) {
     double bytes_per_value = (double)result->encoded_bytes / column->count;
     double ratio = (double)result->raw_bytes / (double)result->encoded_bytes;
     double encode_mb = (double)result->raw_bytes / result->encode_seconds / 1e6;
     double decode_mb = (double)result->raw_bytes / result->decode_seconds / 1e6;
     double decode_mvalues = (double)column->count / result->decode_seconds / 1e6;
-    char encodings[128];
-    format_encodings(result, chunks, encodings, sizeof(encodings));
-    printf("%-18s %-7s %9u %9.3f %7.1fx %10.0f %10.0f %10.0f  %s\n", name,
+    char encodings[160];
+    format_encodings(result, chunk_count, encodings, sizeof(encodings));
+    printf("%-18s %-7s %10u %9.3f %7.1fx %10.0f %10.0f %10.0f  %s\n", name,
            bench_type_name(column->type), column->count, bytes_per_value, ratio, encode_mb,
            decode_mb, decode_mvalues, encodings);
 }
 
 /* ---------------------------------------------------------------------------------------- */
-/* Command line                                                                             */
+/* Synthetic datasets                                                                       */
 /* ---------------------------------------------------------------------------------------- */
-
-static void print_usage(void) {
-    printf("usage: sxdb-bench [--values N] [--min-time SECONDS] [DATASET ...]\n"
-           "       sxdb-bench --csv FILE --column N --type int64|double|bool|string"
-           " [--skip-header]\n"
-           "       sxdb-bench --list\n");
-}
-
-static void print_datasets(void) {
-    for (size_t i = 0; i < bench_dataset_count; i++) {
-        printf("%-18s %-7s %s\n", bench_datasets[i].name, bench_type_name(bench_datasets[i].type),
-               bench_datasets[i].description);
-    }
-}
-
-static bool parse_type(const char* text, bench_type* type) {
-    static const bench_type types[] = {
-        BENCH_TYPE_INT64,
-        BENCH_TYPE_DOUBLE,
-        BENCH_TYPE_BOOL,
-        BENCH_TYPE_STRING,
-    };
-    for (size_t i = 0; i < SX_ARRAY_SIZE(types); i++) {
-        if (strcmp(text, bench_type_name(types[i])) == 0) {
-            *type = types[i];
-            return true;
-        }
-    }
-    return false;
-}
 
 static const bench_dataset* find_dataset(const char* name) {
     for (size_t i = 0; i < bench_dataset_count; i++) {
@@ -392,48 +487,137 @@ static const bench_dataset* find_dataset(const char* name) {
 
 static bool run_dataset(const bench_dataset* dataset, const bench_options* options) {
     bench_column column;
-    bool ok = bench_column_init(&column, dataset->type, options->value_count, 1u << 20) &&
-              dataset->generate(&column, 42);
-    bench_result result;
-    ok = ok && run_benchmark(&column, options->min_seconds, &result);
+    bench_chunks chunks = {0};
+    bool ok = bench_column_init(&column, dataset->type, options->value_count);
     if (ok) {
-        print_result(dataset->name, &column, &result);
+        column.count = options->value_count;
+        ok = dataset->generate(&column, 42) &&
+             bench_chunks_fixed(&chunks, column.count, SX_VECTOR_SIZE);
+    }
+    bench_result result;
+    ok = ok && run_benchmark(&column, &chunks, options, &result);
+    if (ok) {
+        print_result(dataset->name, &column, chunks.count, &result);
     } else {
         fprintf(stderr, "error: dataset %s failed\n", dataset->name);
     }
+    bench_chunks_free(&chunks);
     bench_column_free(&column);
     return ok;
 }
 
-static int run_csv(const bench_options* options) {
-    bench_column column;
-    char error[512];
-    if (!bench_load_csv(options->csv_path, options->csv_column, options->csv_type,
-                        options->skip_header, &column, error, sizeof(error))) {
-        fprintf(stderr, "error: %s\n", error);
-        return 1;
+static int run_datasets(const bench_options* options) {
+    printf("threads: %u\n\n", options->threads);
+    print_header("dataset");
+    bool ok = true;
+    for (size_t i = 0; i < options->dataset_count; i++) {
+        const bench_dataset* dataset = find_dataset(options->datasets[i]);
+        if (dataset == NULL) {
+            fprintf(stderr, "error: unknown dataset %s (see --list)\n", options->datasets[i]);
+            return 2;
+        }
+        ok = run_dataset(dataset, options) && ok;
     }
-    bench_result result;
-    bool ok = run_benchmark(&column, options->min_seconds, &result);
-    if (ok) {
-        print_header();
-        print_result("csv", &column, &result);
+    if (options->dataset_count == 0) {
+        for (size_t i = 0; i < bench_dataset_count; i++) {
+            ok = run_dataset(&bench_datasets[i], options) && ok;
+        }
     }
-    bench_column_free(&column);
     return ok ? 0 : 1;
 }
 
-int main(int argc, char** argv) {
-    bench_options options = {
-        .value_count = DEFAULT_VALUE_COUNT,
-        .min_seconds = DEFAULT_MIN_SECONDS,
-    };
-    const char* selected[64];
-    size_t selected_count = 0;
+/* ---------------------------------------------------------------------------------------- */
+/* CSV input                                                                                */
+/* ---------------------------------------------------------------------------------------- */
 
+static void print_csv_summary(const bench_csv_data* data, double load_seconds) {
+    uint32_t rows = data->columns[0].count;
+    printf("input:   %u files, %u rows, %.1f MB of CSV (loaded in %.1f s)\n", data->file_count,
+           rows, (double)data->input_bytes / 1e6, load_seconds);
+    printf("chunks:  %u, %.0f rows per chunk on average\n", data->chunks.count,
+           (double)rows / data->chunks.count);
+}
+
+static int run_csv(const bench_options* options) {
+    bench_csv_data data;
+    char error[1024];
+    uint64_t load_start = sx_clock_monotonic_ns();
+    if (!bench_load_csv(options->csv_paths, options->csv_path_count, &options->csv, &data, error,
+                        sizeof(error))) {
+        fprintf(stderr, "error: %s\n", error);
+        return 1;
+    }
+    print_csv_summary(&data, seconds_since(load_start));
+    printf("threads: %u\n\n", options->threads);
+    print_header("column");
+
+    bool ok = true;
+    uint64_t total_encoded = 0;
+    for (size_t c = 0; c < data.column_count && ok; c++) {
+        bench_result result;
+        ok = run_benchmark(&data.columns[c], &data.chunks, options, &result);
+        if (ok) {
+            print_result(options->csv.columns[c].label, &data.columns[c], data.chunks.count,
+                         &result);
+            total_encoded += result.encoded_bytes;
+            if (data.columns[c].null_count > 0) {
+                printf("%-18s   %llu NULLs, %llu bytes of NULL bitmaps included above\n", "",
+                       (unsigned long long)data.columns[c].null_count,
+                       (unsigned long long)result.null_bitmap_bytes);
+            }
+        }
+    }
+    if (ok) {
+        uint32_t rows = data.columns[0].count;
+        printf("\ntotal:   %.1f MB encoded for these columns, %.2f bytes per row "
+               "(%.1fx smaller than the CSV files)\n",
+               (double)total_encoded / 1e6, (double)total_encoded / rows,
+               (double)data.input_bytes / (double)total_encoded);
+    }
+    bench_csv_data_free(&data);
+    return ok ? 0 : 1;
+}
+
+/* ---------------------------------------------------------------------------------------- */
+/* Command line                                                                             */
+/* ---------------------------------------------------------------------------------------- */
+
+static void print_usage(void) {
+    printf("usage: sxdb-bench [options] [DATASET ...]\n"
+           "       sxdb-bench [options] --csv PATH [PATH ...] --columns FIELD:TYPE[,...]\n"
+           "                  [--skip-header] [--split-on FIELD]\n"
+           "       sxdb-bench --list\n"
+           "\n"
+           "options:\n"
+           "  --values N      values per synthetic dataset (default %u)\n"
+           "  --min-time S    minimum seconds per measurement (default %.2f)\n"
+           "  --threads N     encode and decode with N threads (default 1)\n"
+           "\n"
+           "CSV input: PATH is a file or a directory (every file in it). Each file is one\n"
+           "series. TYPE is int64, double, bool, string, timestamp, or decimalN (N = 0..18\n"
+           "fraction digits). --split-on starts a new chunk when that field changes.\n",
+           DEFAULT_VALUE_COUNT, DEFAULT_MIN_SECONDS);
+}
+
+static void print_datasets(void) {
+    for (size_t i = 0; i < bench_dataset_count; i++) {
+        printf("%-18s %-7s %s\n", bench_datasets[i].name, bench_type_name(bench_datasets[i].type),
+               bench_datasets[i].description);
+    }
+}
+
+/* Parses the command line. Returns -1 to continue, or an exit status. */
+static int parse_arguments(int argc, char** argv, bench_options* options) {
+    bool in_csv_paths = false;
     for (int i = 1; i < argc; i++) {
         const char* arg = argv[i];
         bool has_value = i + 1 < argc;
+        if (arg[0] != '-' && in_csv_paths && options->csv_path_count < MAX_CSV_PATHS) {
+            options->csv_paths[options->csv_path_count] = argv[i];
+            options->csv_path_count++;
+            continue;
+        }
+        in_csv_paths = false;
         if (strcmp(arg, "--list") == 0) {
             print_datasets();
             return 0;
@@ -446,53 +630,57 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "error: --values must be between 1 and 100000000\n");
                 return 2;
             }
-            options.value_count = (uint32_t)value;
+            options->value_count = (uint32_t)value;
         } else if (strcmp(arg, "--min-time") == 0 && has_value) {
-            options.min_seconds = strtod(argv[++i], NULL);
-        } else if (strcmp(arg, "--csv") == 0 && has_value) {
-            options.csv_path = argv[++i];
-        } else if (strcmp(arg, "--column") == 0 && has_value) {
-            options.csv_column = (unsigned)strtoul(argv[++i], NULL, 10);
-        } else if (strcmp(arg, "--type") == 0 && has_value) {
-            if (!parse_type(argv[++i], &options.csv_type)) {
-                fprintf(stderr, "error: unknown type %s\n", argv[i]);
+            options->min_seconds = strtod(argv[++i], NULL);
+        } else if (strcmp(arg, "--threads") == 0 && has_value) {
+            long value = strtol(argv[++i], NULL, 10);
+            if (value < 1 || value > (long)MAX_THREADS) {
+                fprintf(stderr, "error: --threads must be between 1 and %u\n", MAX_THREADS);
                 return 2;
             }
-            options.csv_type_given = true;
+            options->threads = (unsigned)value;
+        } else if (strcmp(arg, "--csv") == 0) {
+            in_csv_paths = true;
+        } else if (strcmp(arg, "--columns") == 0 && has_value) {
+            char error[256];
+            if (!bench_parse_column_specs(argv[++i], &options->csv, error, sizeof(error))) {
+                fprintf(stderr, "error: %s\n", error);
+                return 2;
+            }
+            options->columns_given = true;
         } else if (strcmp(arg, "--skip-header") == 0) {
-            options.skip_header = true;
-        } else if (arg[0] != '-' && selected_count < SX_ARRAY_SIZE(selected)) {
-            selected[selected_count] = arg;
-            selected_count++;
+            options->csv.skip_header = true;
+        } else if (strcmp(arg, "--split-on") == 0 && has_value) {
+            options->csv.split = true;
+            options->csv.split_field = (unsigned)strtoul(argv[++i], NULL, 10);
+        } else if (arg[0] != '-' && options->dataset_count < MAX_DATASETS) {
+            options->datasets[options->dataset_count] = arg;
+            options->dataset_count++;
         } else {
             print_usage();
             return 2;
         }
     }
+    return -1;
+}
 
-    if (options.csv_path != NULL) {
-        if (!options.csv_type_given) {
-            fprintf(stderr, "error: --csv needs --type\n");
+int main(int argc, char** argv) {
+    static bench_options options;
+    options.value_count = DEFAULT_VALUE_COUNT;
+    options.min_seconds = DEFAULT_MIN_SECONDS;
+    options.threads = 1;
+
+    int status = parse_arguments(argc, argv, &options);
+    if (status >= 0) {
+        return status;
+    }
+    if (options.csv_path_count > 0) {
+        if (!options.columns_given) {
+            fprintf(stderr, "error: --csv needs --columns\n");
             return 2;
         }
         return run_csv(&options);
     }
-
-    print_header();
-    bool ok = true;
-    if (selected_count == 0) {
-        for (size_t i = 0; i < bench_dataset_count; i++) {
-            ok = run_dataset(&bench_datasets[i], &options) && ok;
-        }
-    } else {
-        for (size_t i = 0; i < selected_count; i++) {
-            const bench_dataset* dataset = find_dataset(selected[i]);
-            if (dataset == NULL) {
-                fprintf(stderr, "error: unknown dataset %s (see --list)\n", selected[i]);
-                return 2;
-            }
-            ok = run_dataset(dataset, &options) && ok;
-        }
-    }
-    return ok ? 0 : 1;
+    return run_datasets(&options);
 }

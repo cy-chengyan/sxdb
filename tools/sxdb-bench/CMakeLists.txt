@@ -2,6 +2,7 @@
 
 add_executable(sxdb-bench
     main.c
+    chunks.c
     column.c
     csv.c
     datasets.c)

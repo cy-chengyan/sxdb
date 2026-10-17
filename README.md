@@ -43,10 +43,10 @@ Useful options:
 ```sh
 build/tools/sxdb-bench/sxdb-bench                 # all built-in synthetic datasets
 build/tools/sxdb-bench/sxdb-bench --list          # list the datasets
-build/tools/sxdb-bench/sxdb-bench --csv data.csv --column 2 --type double --skip-header
+build/tools/sxdb-bench/sxdb-bench --csv bars/ --columns 2:timestamp,3:decimal2,7:decimal0 --split-on 9
 ```
 
-The `--csv` form runs the same measurement on one column of your own data.
+The `--csv` form measures columns of your own data. Each path is a CSV file or a directory of them, and every file is treated as one series. Column types are `int64`, `double`, `bool`, `string`, `timestamp`, and `decimalN` (N fraction digits). `--split-on FIELD` starts a new chunk whenever that field changes, which mimics a partition such as one trading day. `--threads N` measures with N threads. Run `sxdb-bench --help` for all options.
 
 ## Documentation
 

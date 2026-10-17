@@ -5,28 +5,64 @@
 #include <stdlib.h>
 #include <string.h>
 
-bool bench_column_init(bench_column* column, bench_type type, uint32_t count,
-                       size_t string_capacity) {
+#define INITIAL_STRING_CAPACITY ((size_t)1 << 20)
+
+/* Resizes *array to hold `count` elements of `size` bytes; new elements are zeroed. */
+static bool resize_array(void** array, size_t old_count, size_t count, size_t size) {
+    void* resized = realloc(*array, count * size);
+    if (resized == NULL) {
+        return false;
+    }
+    if (count > old_count) {
+        memset((uint8_t*)resized + old_count * size, 0, (count - old_count) * size);
+    }
+    *array = resized;
+    return true;
+}
+
+bool bench_column_init(bench_column* column, bench_type type, uint32_t capacity) {
     memset(column, 0, sizeof(*column));
     column->type = type;
-    column->count = count;
-    switch (type) {
-        case BENCH_TYPE_INT64:
-            column->ints = calloc(count, sizeof(int64_t));
-            return column->ints != NULL;
-        case BENCH_TYPE_DOUBLE:
-            column->doubles = calloc(count, sizeof(double));
-            return column->doubles != NULL;
-        case BENCH_TYPE_BOOL:
-            column->bools = calloc(count, sizeof(uint8_t));
-            return column->bools != NULL;
-        case BENCH_TYPE_STRING:
-            column->offsets = calloc((size_t)count + 1u, sizeof(uint32_t));
-            column->string_capacity = string_capacity > 0 ? string_capacity : 1024;
-            column->string_data = malloc(column->string_capacity);
-            return column->offsets != NULL && column->string_data != NULL;
+    if (type == BENCH_TYPE_STRING) {
+        column->string_capacity = INITIAL_STRING_CAPACITY;
+        column->string_data = malloc(column->string_capacity);
+        if (column->string_data == NULL) {
+            return false;
+        }
     }
-    return false;
+    return bench_column_reserve(column, capacity > 0 ? capacity : 1);
+}
+
+bool bench_column_reserve(bench_column* column, uint32_t capacity) {
+    if (capacity <= column->capacity) {
+        return true;
+    }
+    size_t old = column->capacity;
+    bool ok = true;
+    switch (column->type) {
+        case BENCH_TYPE_INT64:
+            ok = resize_array((void**)&column->ints, old, capacity, sizeof(int64_t));
+            break;
+        case BENCH_TYPE_DOUBLE:
+            ok = resize_array((void**)&column->doubles, old, capacity, sizeof(double));
+            break;
+        case BENCH_TYPE_BOOL:
+            ok = resize_array((void**)&column->bools, old, capacity, sizeof(uint8_t));
+            break;
+        case BENCH_TYPE_STRING: {
+            size_t old_offsets = column->offsets == NULL ? 0 : old + 1u;
+            ok = resize_array((void**)&column->offsets, old_offsets, (size_t)capacity + 1u,
+                              sizeof(uint32_t));
+            break;
+        }
+    }
+    if (ok && column->nulls != NULL) {
+        ok = resize_array((void**)&column->nulls, old, capacity, sizeof(uint8_t));
+    }
+    if (ok) {
+        column->capacity = capacity;
+    }
+    return ok;
 }
 
 bool bench_column_set_string(bench_column* column, uint32_t index, const char* text,
@@ -55,12 +91,25 @@ bool bench_column_set_string(bench_column* column, uint32_t index, const char* t
     return true;
 }
 
+bool bench_column_mark_null(bench_column* column, uint32_t index) {
+    if (column->nulls == NULL) {
+        column->nulls = calloc(column->capacity, sizeof(uint8_t));
+        if (column->nulls == NULL) {
+            return false;
+        }
+    }
+    column->nulls[index] = 1;
+    column->null_count++;
+    return true;
+}
+
 void bench_column_free(bench_column* column) {
     free(column->ints);
     free(column->doubles);
     free(column->bools);
     free(column->offsets);
     free(column->string_data);
+    free(column->nulls);
     memset(column, 0, sizeof(*column));
 }
 
