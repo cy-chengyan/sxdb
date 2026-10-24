@@ -22,6 +22,8 @@
 #define SX_ENCODING_KERNELS_H
 
 #include "common/bits.h"
+#include "common/compiler.h"
+#include "encoding/bitpack.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -106,13 +108,29 @@ typedef struct sx_codec_kernels {
                        const sx_alp_scales* scales, double* out);
 
     /*
-     * Rebuilds values from `slot_count` deltas stored in the lane-contiguous order of
-     * bitpack.h: out[0] = first and out[i + 1] = out[i] + delta of slot i, wrapping
-     * modulo 2^64. `deltas` holds sx_bitpack_padded_count(slot_count) entries. Writes
-     * exactly slot_count + 1 values.
+     * First pass of DELTA_FOR and DELTA_PATCHED decoding: decodes the deltas
+     * base + unpacked[i] * multiplier of `slot_count` slots (1 to SX_VECTOR_SIZE - 1) as
+     * decode_for does, and stores row r of the block in row r + 1 of `scratch` (rows of
+     * 16 values). Row 0 of `scratch` is set to zero, and so are the rows after the last
+     * one up to sx_delta_scratch_last_row(rows). `lane_totals[l]` is set to the sum of
+     * the deltas in lane l, padding included, wrapping modulo 2^64. `scratch` holds
+     * SX_DELTA_SCRATCH_SIZE values.
      */
-    void (*rebuild_deltas)(const uint64_t* deltas, uint32_t slot_count, uint64_t first,
-                           uint64_t* out);
+    void (*decode_deltas)(const uint8_t* packed, uint32_t slot_count, uint32_t width, uint64_t base,
+                          uint64_t multiplier, uint64_t* scratch, uint64_t* lane_totals);
+
+    /*
+     * Second pass: rebuilds values from deltas in the lane-contiguous order of bitpack.h,
+     * laid out in `scratch` as decode_deltas leaves them, with `lane_totals` the sums of
+     * the lanes. With rows = ceil(slot_count / 16), lane l starts at `first` plus the
+     * totals of the lanes before it, and out[l * rows + j] is that start plus scratch rows
+     * 0 to j of lane l. So out[0] = first and out[i + 1] = out[i] + delta of slot i,
+     * wrapping modulo 2^64. Writes the 16 * rows values of all lanes (those past
+     * slot_count come from padding) and also out[16 * rows] when slot_count is
+     * 16 * rows: max(slot_count + 1, 16 * rows) values, at most SX_VECTOR_SIZE.
+     */
+    void (*rebuild_deltas)(const uint64_t* scratch, uint32_t slot_count, uint64_t first,
+                           const uint64_t* lane_totals, uint64_t* out);
 
     /*
      * ALP encoding of `count` values with one exponent/factor pair (sx_alp_encode_value).
@@ -195,6 +213,49 @@ extern const sx_codec_kernels sx_kernels_scalar;
 extern const sx_codec_kernels sx_kernels_avx2;
 extern const sx_codec_kernels sx_kernels_avx512;
 extern const sx_codec_kernels sx_kernels_neon;
+
+/* ---------------------------------------------------------------------------------------- */
+/* Helpers shared by the kernels                                                            */
+/* ---------------------------------------------------------------------------------------- */
+
+/* How decoded offsets are multiplied. */
+typedef enum sx_multiply_kind {
+    SX_MULTIPLY_NONE,   /* multiplier 1, or width 0 (every offset is 0) */
+    SX_MULTIPLY_NARROW, /* offsets and multiplier below 2^32: one 32x32->64-bit product */
+    SX_MULTIPLY_WIDE,   /* full 64-bit products */
+} sx_multiply_kind;
+
+static inline sx_multiply_kind sx_multiply_kind_of(uint32_t width, uint64_t multiplier) {
+    if (multiplier == 1 || width == 0) {
+        return SX_MULTIPLY_NONE;
+    }
+    return width <= 32u && multiplier <= UINT32_MAX ? SX_MULTIPLY_NARROW : SX_MULTIPLY_WIDE;
+}
+
+/*
+ * Scratch rows of the delta kernels: a zero row in front of at most SX_VECTOR_SIZE / 16
+ * rows of deltas. rebuild_deltas reads blocks of up to eight rows, so the rows after the
+ * last one are zeroed up to the end of its block.
+ */
+#define SX_DELTA_SCRATCH_SIZE ((SX_VECTOR_SIZE / SX_BITPACK_LANES + 1u) * SX_BITPACK_LANES)
+
+static inline uint32_t sx_delta_scratch_last_row(uint32_t rows) {
+    return (rows - 1u) | 7u;
+}
+
+/*
+ * Lane starts for rebuild_deltas: `first` plus the totals of the lanes before each lane.
+ * Returns the value after the last lane, which is out[16 * rows] of a full block.
+ */
+static inline uint64_t sx_delta_lane_starts(const uint64_t* lane_totals, uint64_t first,
+                                            uint64_t* starts) {
+    uint64_t start = first;
+    for (uint32_t lane = 0; lane < SX_BITPACK_LANES; lane++) {
+        starts[lane] = start;
+        start += lane_totals[lane];
+    }
+    return start;
+}
 
 /* ---------------------------------------------------------------------------------------- */
 /* ALP arithmetic shared by every kernel and by the codec                                   */

@@ -148,29 +148,65 @@ static void bitunpack_avx2(const uint8_t* packed, uint32_t count, uint32_t width
     }
 }
 
-static void decode_for_avx2(const uint8_t* packed, uint32_t count, uint32_t width, uint64_t base,
-                            uint64_t multiplier, uint64_t* out) {
-    __m256i mask = _mm256_set1_epi64x((long long)sx_low_mask_u64(width));
-    __m256i base_vector = _mm256_set1_epi64x((long long)base);
-    __m256i multiplier_vector = _mm256_set1_epi64x((long long)multiplier);
-    __m256i multiplier_high = _mm256_set1_epi64x((long long)(multiplier >> 32));
-    /* Offsets below 2^32 times a multiplier below 2^32 need one 32x32->64 product. */
-    bool narrow = width <= 32u && multiplier <= UINT32_MAX;
+/* Broadcast constants of frame-of-reference decoding. */
+typedef struct for_constants {
+    __m256i mask;
+    __m256i base;
+    __m256i multiplier;
+    __m256i multiplier_high;
+} for_constants;
+
+static inline for_constants make_for_constants(uint32_t width, uint64_t base, uint64_t multiplier) {
+    for_constants c = {
+        .mask = _mm256_set1_epi64x((long long)sx_low_mask_u64(width)),
+        .base = _mm256_set1_epi64x((long long)base),
+        .multiplier = _mm256_set1_epi64x((long long)multiplier),
+        .multiplier_high = _mm256_set1_epi64x((long long)(multiplier >> 32)),
+    };
+    return c;
+}
+
+/* Decodes row `row`: base + unpacked * multiplier. */
+static SX_ALWAYS_INLINE void decode_row(const uint8_t* packed, uint32_t row, uint32_t width,
+                                        const for_constants* c, sx_multiply_kind kind, __m256i* v) {
+    unpack_or_zero_row(packed, row, width, c->mask, v);
+    for (uint32_t q = 0; q < VECTORS_PER_ROW; q++) {
+        if (kind == SX_MULTIPLY_NARROW) {
+            v[q] = _mm256_mul_epu32(v[q], c->multiplier);
+        } else if (kind == SX_MULTIPLY_WIDE) {
+            v[q] = multiply_u64(v[q], c->multiplier, c->multiplier_high);
+        }
+        v[q] = _mm256_add_epi64(v[q], c->base);
+    }
+}
+
+static SX_ALWAYS_INLINE void decode_for_rows(const uint8_t* packed, uint32_t count, uint32_t width,
+                                             const for_constants* c, sx_multiply_kind kind,
+                                             uint64_t* out) {
     __m256i v[VECTORS_PER_ROW];
     for (uint32_t row = 0; row < sx_bitpack_rows(count); row++) {
-        unpack_or_zero_row(packed, row, width, mask, v);
+        decode_row(packed, row, width, c, kind, v);
         uint64_t* dst = out + (size_t)row * SX_BITPACK_LANES;
         for (uint32_t q = 0; q < VECTORS_PER_ROW; q++) {
-            __m256i product;
-            if (multiplier == 1) {
-                product = v[q];
-            } else if (narrow) {
-                product = _mm256_mul_epu32(v[q], multiplier_vector);
-            } else {
-                product = multiply_u64(v[q], multiplier_vector, multiplier_high);
-            }
-            store(dst + q * VECTOR_LANES, _mm256_add_epi64(product, base_vector));
+            store(dst + q * VECTOR_LANES, v[q]);
         }
+    }
+}
+
+/* Each kind of multiplication gets its own copy of the loop. */
+static void decode_for_avx2(const uint8_t* packed, uint32_t count, uint32_t width, uint64_t base,
+                            uint64_t multiplier, uint64_t* out) {
+    for_constants c = make_for_constants(width, base, multiplier);
+    switch (sx_multiply_kind_of(width, multiplier)) {
+        case SX_MULTIPLY_NONE:
+            decode_for_rows(packed, count, width, &c, SX_MULTIPLY_NONE, out);
+            break;
+        case SX_MULTIPLY_NARROW:
+            decode_for_rows(packed, count, width, &c, SX_MULTIPLY_NARROW, out);
+            break;
+        default:
+            decode_for_rows(packed, count, width, &c, SX_MULTIPLY_WIDE, out);
+            break;
     }
 }
 
@@ -206,85 +242,101 @@ static inline void transpose_4x4(__m256i* m) {
     m[3] = _mm256_permute2x128_si256(t1, t3, 0x31);
 }
 
-/* Stores the four values of a lane block, or only those that belong to the lane. */
-static inline void store_lane_block(uint64_t* dst, uint32_t lane_slots, uint32_t row,
-                                    __m256i values) {
-    if (lane_slots >= row + 4u) {
-        store(dst, values);
-    } else if (lane_slots > row) {
-        __m256i valid = _mm256_cmpgt_epi64(_mm256_set1_epi64x((long long)(lane_slots - row)),
-                                           _mm256_setr_epi64x(0, 1, 2, 3));
-        _mm256_maskstore_epi64((long long*)dst, valid, values);
+static void zero_rows(uint64_t* rows, uint32_t count) {
+    for (uint32_t i = 0; i < count * VECTORS_PER_ROW; i++) {
+        store(rows + i * VECTOR_LANES, _mm256_setzero_si256());
+    }
+}
+
+/* Decodes the deltas into scratch rows 1 to `rows` and sums up each lane on the way. */
+static SX_ALWAYS_INLINE void decode_deltas_rows(const uint8_t* packed, uint32_t rows,
+                                                uint32_t width, const for_constants* c,
+                                                sx_multiply_kind kind, uint64_t* scratch,
+                                                uint64_t* lane_totals) {
+    __m256i totals[VECTORS_PER_ROW];
+    __m256i v[VECTORS_PER_ROW];
+    for (uint32_t q = 0; q < VECTORS_PER_ROW; q++) {
+        totals[q] = _mm256_setzero_si256();
+    }
+    uint64_t* dst = scratch + SX_BITPACK_LANES;
+    for (uint32_t row = 0; row < rows; row++) {
+        decode_row(packed, row, width, c, kind, v);
+        for (uint32_t q = 0; q < VECTORS_PER_ROW; q++) {
+            store(dst + q * VECTOR_LANES, v[q]);
+            totals[q] = _mm256_add_epi64(totals[q], v[q]);
+        }
+        dst += SX_BITPACK_LANES;
+    }
+    for (uint32_t q = 0; q < VECTORS_PER_ROW; q++) {
+        store(lane_totals + q * VECTOR_LANES, totals[q]);
+    }
+}
+
+static void decode_deltas_avx2(const uint8_t* packed, uint32_t slot_count, uint32_t width,
+                               uint64_t base, uint64_t multiplier, uint64_t* scratch,
+                               uint64_t* lane_totals) {
+    uint32_t rows = sx_bitpack_rows(slot_count);
+    for_constants c = make_for_constants(width, base, multiplier);
+    zero_rows(scratch, 1);
+    switch (sx_multiply_kind_of(width, multiplier)) {
+        case SX_MULTIPLY_NONE:
+            decode_deltas_rows(packed, rows, width, &c, SX_MULTIPLY_NONE, scratch, lane_totals);
+            break;
+        case SX_MULTIPLY_NARROW:
+            decode_deltas_rows(packed, rows, width, &c, SX_MULTIPLY_NARROW, scratch, lane_totals);
+            break;
+        default:
+            decode_deltas_rows(packed, rows, width, &c, SX_MULTIPLY_WIDE, scratch, lane_totals);
+            break;
+    }
+    uint32_t last_row = sx_delta_scratch_last_row(rows);
+    if (last_row > rows) {
+        zero_rows(scratch + (size_t)(rows + 1u) * SX_BITPACK_LANES, last_row - rows);
     }
 }
 
 /*
  * Each lane holds a run of consecutive slots, so the lanes are summed independently:
- * running sums go down the rows, starting from each lane's first value, and each 4x4
- * block (four rows of four lanes) is transposed so that a lane's four values become one
- * vector stored in place.
+ * running sums go down the rows from each lane's start, and each 4x4 block (four rows of
+ * four lanes) is transposed so that a lane's four values become one vector stored in
+ * place. A last block of fewer than four rows is stored with a mask, so that it does not
+ * run into the next lane.
  */
-static void rebuild_deltas_avx2(const uint64_t* deltas, uint32_t slot_count, uint64_t first,
-                                uint64_t* out) {
+static void rebuild_deltas_avx2(const uint64_t* scratch, uint32_t slot_count, uint64_t first,
+                                const uint64_t* lane_totals, uint64_t* out) {
     uint32_t rows = sx_bitpack_rows(slot_count);
-    __m256i totals[VECTORS_PER_ROW];
-    for (uint32_t q = 0; q < VECTORS_PER_ROW; q++) {
-        totals[q] = _mm256_setzero_si256();
-    }
-    for (uint32_t row = 0; row < rows; row++) {
-        const uint64_t* src = deltas + (size_t)row * SX_BITPACK_LANES;
-        for (uint32_t q = 0; q < VECTORS_PER_ROW; q++) {
-            totals[q] = _mm256_add_epi64(totals[q], load(src + q * VECTOR_LANES));
-        }
-    }
-    uint64_t lane_totals[SX_BITPACK_LANES];
-    for (uint32_t q = 0; q < VECTORS_PER_ROW; q++) {
-        store(lane_totals + q * VECTOR_LANES, totals[q]);
-    }
-
-    /* Lane l starts after all slots of the lanes before it; lanes fill up in order. */
-    uint64_t lane_starts[SX_BITPACK_LANES];
-    uint32_t lane_slots[SX_BITPACK_LANES];
-    uint64_t start = first;
-    for (uint32_t lane = 0; lane < SX_BITPACK_LANES; lane++) {
-        uint32_t before = lane * rows;
-        lane_starts[lane] = start;
-        lane_slots[lane] = 0;
-        if (slot_count > before) {
-            lane_slots[lane] = slot_count - before < rows ? slot_count - before : rows;
-        }
-        start += lane_totals[lane];
-    }
-    uint32_t full_lanes = slot_count / rows;
-
-    out[0] = first;
-    uint64_t* values = out + 1;
+    uint64_t starts[SX_BITPACK_LANES];
+    uint64_t end = sx_delta_lane_starts(lane_totals, first, starts);
+    uint32_t blocks = (rows + 3u) / 4u;
+    /* All ones in the rows of the last block that belong to the lanes. */
+    __m256i last_mask = _mm256_cmpgt_epi64(_mm256_set1_epi64x(rows - (blocks - 1u) * 4u),
+                                           _mm256_setr_epi64x(0, 1, 2, 3));
     for (uint32_t group = 0; group < VECTORS_PER_ROW; group++) {
-        uint32_t first_lane = group * VECTOR_LANES;
-        __m256i running = load(lane_starts + first_lane);
-        for (uint32_t row = 0; row < rows; row += 4u) {
-            uint32_t block_rows = rows - row < 4u ? rows - row : 4u;
-            __m256i block[4];
+        __m256i running = load(starts + group * VECTOR_LANES);
+        const uint64_t* src = scratch + group * VECTOR_LANES;
+        uint64_t* dst = out + group * VECTOR_LANES * rows;
+        for (uint32_t block = 0; block < blocks; block++) {
+            __m256i m[4];
             for (uint32_t j = 0; j < 4u; j++) {
-                if (j < block_rows) {
-                    const uint64_t* src = deltas + (size_t)(row + j) * SX_BITPACK_LANES;
-                    running = _mm256_add_epi64(running, load(src + first_lane));
-                }
-                block[j] = running;
+                running = _mm256_add_epi64(running, load(src));
+                src += SX_BITPACK_LANES;
+                m[j] = running;
             }
-            transpose_4x4(block);
-            uint64_t* dst = values + (size_t)first_lane * rows + row;
-            if (block_rows == 4u && first_lane + VECTOR_LANES <= full_lanes) {
+            transpose_4x4(m);
+            if (block + 1u < blocks) {
                 for (uint32_t i = 0; i < 4u; i++) {
-                    store(dst + (size_t)i * rows, block[i]);
+                    store(dst + (size_t)i * rows, m[i]);
                 }
             } else {
                 for (uint32_t i = 0; i < 4u; i++) {
-                    store_lane_block(dst + (size_t)i * rows, lane_slots[first_lane + i], row,
-                                     block[i]);
+                    _mm256_maskstore_epi64((long long*)(dst + (size_t)i * rows), last_mask, m[i]);
                 }
             }
+            dst += 4;
         }
+    }
+    if (slot_count == SX_BITPACK_LANES * rows) {
+        out[SX_BITPACK_LANES * rows] = end;
     }
 }
 
@@ -697,6 +749,7 @@ const sx_codec_kernels sx_kernels_avx2 = {
     .bitunpack = bitunpack_avx2,
     .decode_for = decode_for_avx2,
     .decode_alp = decode_alp_avx2,
+    .decode_deltas = decode_deltas_avx2,
     .rebuild_deltas = rebuild_deltas_avx2,
     .encode_alp = encode_alp_avx2,
     .summarize_ints = summarize_ints_avx2,

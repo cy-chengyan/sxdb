@@ -148,29 +148,66 @@ static void bitunpack_neon(const uint8_t* packed, uint32_t count, uint32_t width
     }
 }
 
-static void decode_for_neon(const uint8_t* packed, uint32_t count, uint32_t width, uint64_t base,
-                            uint64_t multiplier, uint64_t* out) {
-    uint64x2_t mask = vdupq_n_u64(sx_low_mask_u64(width));
-    uint64x2_t base_vector = vdupq_n_u64(base);
-    uint32x2_t multiplier_low = vdup_n_u32((uint32_t)multiplier);
-    uint32x2_t multiplier_high = vdup_n_u32((uint32_t)(multiplier >> 32));
-    /* Offsets below 2^32 times a multiplier below 2^32 need one 32x32->64 product. */
-    bool narrow = width <= 32u && multiplier <= UINT32_MAX;
+/* Broadcast constants of frame-of-reference decoding. */
+typedef struct for_constants {
+    uint64x2_t mask;
+    uint64x2_t base;
+    uint32x2_t multiplier_low;
+    uint32x2_t multiplier_high;
+} for_constants;
+
+static inline for_constants make_for_constants(uint32_t width, uint64_t base, uint64_t multiplier) {
+    for_constants c = {
+        .mask = vdupq_n_u64(sx_low_mask_u64(width)),
+        .base = vdupq_n_u64(base),
+        .multiplier_low = vdup_n_u32((uint32_t)multiplier),
+        .multiplier_high = vdup_n_u32((uint32_t)(multiplier >> 32)),
+    };
+    return c;
+}
+
+/* Decodes row `row`: base + unpacked * multiplier. */
+static SX_ALWAYS_INLINE void decode_row(const uint8_t* packed, uint32_t row, uint32_t width,
+                                        const for_constants* c, sx_multiply_kind kind,
+                                        uint64x2_t* v) {
+    unpack_or_zero_row(packed, row, width, c->mask, v);
+    for (uint32_t q = 0; q < VECTORS_PER_ROW; q++) {
+        if (kind == SX_MULTIPLY_NARROW) {
+            v[q] = vmull_u32(vmovn_u64(v[q]), c->multiplier_low);
+        } else if (kind == SX_MULTIPLY_WIDE) {
+            v[q] = multiply_u64(v[q], c->multiplier_low, c->multiplier_high);
+        }
+        v[q] = vaddq_u64(v[q], c->base);
+    }
+}
+
+static SX_ALWAYS_INLINE void decode_for_rows(const uint8_t* packed, uint32_t count, uint32_t width,
+                                             const for_constants* c, sx_multiply_kind kind,
+                                             uint64_t* out) {
     uint64x2_t v[VECTORS_PER_ROW];
     for (uint32_t row = 0; row < sx_bitpack_rows(count); row++) {
-        unpack_or_zero_row(packed, row, width, mask, v);
+        decode_row(packed, row, width, c, kind, v);
         uint64_t* dst = out + (size_t)row * SX_BITPACK_LANES;
         for (uint32_t q = 0; q < VECTORS_PER_ROW; q++) {
-            uint64x2_t product;
-            if (multiplier == 1) {
-                product = v[q];
-            } else if (narrow) {
-                product = vmull_u32(vmovn_u64(v[q]), multiplier_low);
-            } else {
-                product = multiply_u64(v[q], multiplier_low, multiplier_high);
-            }
-            vst1q_u64(dst + q * VECTOR_LANES, vaddq_u64(product, base_vector));
+            vst1q_u64(dst + q * VECTOR_LANES, v[q]);
         }
+    }
+}
+
+/* Each kind of multiplication gets its own copy of the loop. */
+static void decode_for_neon(const uint8_t* packed, uint32_t count, uint32_t width, uint64_t base,
+                            uint64_t multiplier, uint64_t* out) {
+    for_constants c = make_for_constants(width, base, multiplier);
+    switch (sx_multiply_kind_of(width, multiplier)) {
+        case SX_MULTIPLY_NONE:
+            decode_for_rows(packed, count, width, &c, SX_MULTIPLY_NONE, out);
+            break;
+        case SX_MULTIPLY_NARROW:
+            decode_for_rows(packed, count, width, &c, SX_MULTIPLY_NARROW, out);
+            break;
+        default:
+            decode_for_rows(packed, count, width, &c, SX_MULTIPLY_WIDE, out);
+            break;
     }
 }
 
@@ -194,76 +231,98 @@ static void decode_alp_neon(const uint8_t* packed, uint32_t count, uint32_t widt
     }
 }
 
+static void zero_rows(uint64_t* rows, uint32_t count) {
+    for (uint32_t i = 0; i < count * VECTORS_PER_ROW; i++) {
+        vst1q_u64(rows + i * VECTOR_LANES, vdupq_n_u64(0));
+    }
+}
+
+/* Decodes the deltas into scratch rows 1 to `rows` and sums up each lane on the way. */
+static SX_ALWAYS_INLINE void decode_deltas_rows(const uint8_t* packed, uint32_t rows,
+                                                uint32_t width, const for_constants* c,
+                                                sx_multiply_kind kind, uint64_t* scratch,
+                                                uint64_t* lane_totals) {
+    uint64x2_t totals[VECTORS_PER_ROW];
+    uint64x2_t v[VECTORS_PER_ROW];
+    for (uint32_t q = 0; q < VECTORS_PER_ROW; q++) {
+        totals[q] = vdupq_n_u64(0);
+    }
+    uint64_t* dst = scratch + SX_BITPACK_LANES;
+    for (uint32_t row = 0; row < rows; row++) {
+        decode_row(packed, row, width, c, kind, v);
+        for (uint32_t q = 0; q < VECTORS_PER_ROW; q++) {
+            vst1q_u64(dst + q * VECTOR_LANES, v[q]);
+            totals[q] = vaddq_u64(totals[q], v[q]);
+        }
+        dst += SX_BITPACK_LANES;
+    }
+    for (uint32_t q = 0; q < VECTORS_PER_ROW; q++) {
+        vst1q_u64(lane_totals + q * VECTOR_LANES, totals[q]);
+    }
+}
+
+static void decode_deltas_neon(const uint8_t* packed, uint32_t slot_count, uint32_t width,
+                               uint64_t base, uint64_t multiplier, uint64_t* scratch,
+                               uint64_t* lane_totals) {
+    uint32_t rows = sx_bitpack_rows(slot_count);
+    for_constants c = make_for_constants(width, base, multiplier);
+    zero_rows(scratch, 1);
+    switch (sx_multiply_kind_of(width, multiplier)) {
+        case SX_MULTIPLY_NONE:
+            decode_deltas_rows(packed, rows, width, &c, SX_MULTIPLY_NONE, scratch, lane_totals);
+            break;
+        case SX_MULTIPLY_NARROW:
+            decode_deltas_rows(packed, rows, width, &c, SX_MULTIPLY_NARROW, scratch, lane_totals);
+            break;
+        default:
+            decode_deltas_rows(packed, rows, width, &c, SX_MULTIPLY_WIDE, scratch, lane_totals);
+            break;
+    }
+    uint32_t last_row = sx_delta_scratch_last_row(rows);
+    if (last_row > rows) {
+        zero_rows(scratch + (size_t)(rows + 1u) * SX_BITPACK_LANES, last_row - rows);
+    }
+}
+
 /*
  * Each lane holds a run of consecutive slots, so the lanes are summed independently:
- * running sums go down the rows (two rows at a time), starting from each lane's first
- * value, and each 2x2 block is transposed so that a lane's two values are adjacent.
+ * running sums go down the rows (two rows at a time) from each lane's start, and each
+ * 2x2 block is transposed so that a lane's two values are adjacent. A last single row
+ * is stored value by value.
  */
-static void rebuild_deltas_neon(const uint64_t* deltas, uint32_t slot_count, uint64_t first,
-                                uint64_t* out) {
+static void rebuild_deltas_neon(const uint64_t* scratch, uint32_t slot_count, uint64_t first,
+                                const uint64_t* lane_totals, uint64_t* out) {
     uint32_t rows = sx_bitpack_rows(slot_count);
-    uint64x2_t sums[VECTORS_PER_ROW];
-    for (uint32_t q = 0; q < VECTORS_PER_ROW; q++) {
-        sums[q] = vdupq_n_u64(0);
-    }
-    for (uint32_t row = 0; row < rows; row++) {
-        for (uint32_t q = 0; q < VECTORS_PER_ROW; q++) {
-            sums[q] = vaddq_u64(
-                sums[q], vld1q_u64(deltas + (size_t)row * SX_BITPACK_LANES + q * VECTOR_LANES));
-        }
-    }
-    /* Lane l starts after all slots of the lanes before it. */
-    uint64_t lane_totals[SX_BITPACK_LANES];
-    for (uint32_t q = 0; q < VECTORS_PER_ROW; q++) {
-        vst1q_u64(lane_totals + q * VECTOR_LANES, sums[q]);
-    }
-    uint64_t lane_starts[SX_BITPACK_LANES];
-    uint32_t lane_slots[SX_BITPACK_LANES];
-    uint64_t start = first;
-    for (uint32_t lane = 0; lane < SX_BITPACK_LANES; lane++) {
-        uint32_t before = lane * rows;
-        lane_starts[lane] = start;
-        lane_slots[lane] = 0;
-        if (slot_count > before) {
-            lane_slots[lane] = slot_count - before < rows ? slot_count - before : rows;
-        }
-        start += lane_totals[lane];
-    }
-
-    uint32_t full_lanes = slot_count / rows;
-
-    out[0] = first;
-    uint64_t* values = out + 1;
+    uint64_t starts[SX_BITPACK_LANES];
+    uint64_t end = sx_delta_lane_starts(lane_totals, first, starts);
     uint64x2_t running[VECTORS_PER_ROW];
     for (uint32_t q = 0; q < VECTORS_PER_ROW; q++) {
-        running[q] = vld1q_u64(lane_starts + q * VECTOR_LANES);
+        running[q] = vld1q_u64(starts + q * VECTOR_LANES);
     }
-    for (uint32_t row = 0; row < rows; row += 2u) {
-        const uint64_t* row0 = deltas + (size_t)row * SX_BITPACK_LANES;
-        const uint64_t* row1 = row0 + SX_BITPACK_LANES;
-        bool second_row = row + 1u < rows;
+    const uint64_t* src = scratch;
+    uint32_t j = 0;
+    for (; j + 2u <= rows; j += 2u) {
         for (uint32_t q = 0; q < VECTORS_PER_ROW; q++) {
-            uint64x2_t sum0 = vaddq_u64(running[q], vld1q_u64(row0 + q * VECTOR_LANES));
-            uint64x2_t sum1 =
-                second_row ? vaddq_u64(sum0, vld1q_u64(row1 + q * VECTOR_LANES)) : sum0;
-            running[q] = sum1;
-            /* lane_values[k] holds rows `row` and `row + 1` of lane 2q + k. */
-            uint64x2_t lane_values[2] = {vzip1q_u64(sum0, sum1), vzip2q_u64(sum0, sum1)};
-            uint64_t* dst = values + (size_t)(q * VECTOR_LANES) * rows + row;
-            if (second_row && q * VECTOR_LANES + 2u <= full_lanes) {
-                vst1q_u64(dst, lane_values[0]);
-                vst1q_u64(dst + rows, lane_values[1]);
-                continue;
-            }
-            for (uint32_t k = 0; k < 2u; k++) {
-                uint32_t slots = lane_slots[q * VECTOR_LANES + k];
-                if (slots >= row + 2u) {
-                    vst1q_u64(dst + (size_t)k * rows, lane_values[k]);
-                } else if (slots == row + 1u) {
-                    vst1q_lane_u64(dst + (size_t)k * rows, lane_values[k], 0);
-                }
-            }
+            uint64x2_t row0 = vaddq_u64(running[q], vld1q_u64(src + q * VECTOR_LANES));
+            uint64x2_t row1 = vaddq_u64(row0, vld1q_u64(src + SX_BITPACK_LANES + q * VECTOR_LANES));
+            running[q] = row1;
+            /* Lanes 2q and 2q + 1, rows j and j + 1. */
+            uint64_t* dst = out + (size_t)(q * VECTOR_LANES) * rows + j;
+            vst1q_u64(dst, vzip1q_u64(row0, row1));
+            vst1q_u64(dst + rows, vzip2q_u64(row0, row1));
         }
+        src += 2u * SX_BITPACK_LANES;
+    }
+    if (j < rows) {
+        for (uint32_t q = 0; q < VECTORS_PER_ROW; q++) {
+            uint64x2_t row0 = vaddq_u64(running[q], vld1q_u64(src + q * VECTOR_LANES));
+            uint64_t* dst = out + (size_t)(q * VECTOR_LANES) * rows + j;
+            vst1q_lane_u64(dst, row0, 0);
+            vst1q_lane_u64(dst + rows, row0, 1);
+        }
+    }
+    if (slot_count == SX_BITPACK_LANES * rows) {
+        out[SX_BITPACK_LANES * rows] = end;
     }
 }
 
@@ -569,6 +628,7 @@ const sx_codec_kernels sx_kernels_neon = {
     .bitunpack = bitunpack_neon,
     .decode_for = decode_for_neon,
     .decode_alp = decode_alp_neon,
+    .decode_deltas = decode_deltas_neon,
     .rebuild_deltas = rebuild_deltas_neon,
     .encode_alp = encode_alp_neon,
     .summarize_ints = summarize_ints_neon,

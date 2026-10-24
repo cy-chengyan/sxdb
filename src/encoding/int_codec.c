@@ -545,8 +545,9 @@ static bool decode_for(sx_byte_reader* in, uint32_t count, int64_t* out) {
 
 /*
  * The deltas of DELTA_FOR and DELTA_PATCHED are delta_base + offset * multiplier, with the
- * `count - 1` offsets packed in the lane-contiguous order. They are decoded like
- * FOR_BITPACK into `deltas`, patched if needed, and then summed up by rebuild_deltas.
+ * `count - 1` offsets packed in the lane-contiguous order. decode_deltas decodes them into
+ * rows of a scratch array and sums up each lane, DELTA_PATCHED then replaces the deltas of
+ * its exceptions, and rebuild_deltas turns the deltas into values (see kernels.h).
  */
 static bool decode_delta_for(sx_byte_reader* in, uint32_t count, int64_t* out) {
     uint64_t first = sx_reader_get_u64(in);
@@ -564,9 +565,11 @@ static bool decode_delta_for(sx_byte_reader* in, uint32_t count, int64_t* out) {
         return false;
     }
     const sx_codec_kernels* kernels = sx_codec_kernels_active();
-    uint64_t deltas[SX_VECTOR_SIZE];
-    kernels->decode_for(packed, delta_count, width, delta_base, multiplier, deltas);
-    kernels->rebuild_deltas(deltas, delta_count, first, (uint64_t*)out);
+    SX_ALIGNED(64) uint64_t scratch[SX_DELTA_SCRATCH_SIZE];
+    uint64_t lane_totals[SX_BITPACK_LANES];
+    kernels->decode_deltas(packed, delta_count, width, delta_base, multiplier, scratch,
+                           lane_totals);
+    kernels->rebuild_deltas(scratch, delta_count, first, lane_totals, (uint64_t*)out);
     return true;
 }
 
@@ -591,10 +594,15 @@ static bool decode_delta_patched(sx_byte_reader* in, uint32_t count, int64_t* ou
         return false;
     }
     const sx_codec_kernels* kernels = sx_codec_kernels_active();
-    uint64_t deltas[SX_VECTOR_SIZE];
-    kernels->decode_for(packed, delta_count, width, delta_base, multiplier, deltas);
+    SX_ALIGNED(64) uint64_t scratch[SX_DELTA_SCRATCH_SIZE];
+    uint64_t lane_totals[SX_BITPACK_LANES];
+    kernels->decode_deltas(packed, delta_count, width, delta_base, multiplier, scratch,
+                           lane_totals);
 
-    /* An exception replaces the offset of its slot (whose packed value is 0). */
+    /*
+     * An exception replaces the delta of its slot (whose packed offset is 0), and the total
+     * of the slot's lane follows. Scratch row r + 1 holds row r of the block.
+     */
     uint32_t rows = sx_bitpack_rows(delta_count);
     for (uint32_t i = 0; i < exceptions; i++) {
         uint32_t position = sx_load_u16(positions + i * sizeof(uint16_t));
@@ -602,9 +610,12 @@ static bool decode_delta_patched(sx_byte_reader* in, uint32_t count, int64_t* ou
             return false;
         }
         uint64_t offset = sx_load_u64(patches + i * sizeof(uint64_t));
-        deltas[sx_bitpack_lane_position(position, rows)] = delta_base + offset * multiplier;
+        uint64_t delta = delta_base + offset * multiplier;
+        uint64_t* slot = &scratch[SX_BITPACK_LANES + sx_bitpack_lane_position(position, rows)];
+        lane_totals[position / rows] += delta - *slot;
+        *slot = delta;
     }
-    kernels->rebuild_deltas(deltas, delta_count, first, (uint64_t*)out);
+    kernels->rebuild_deltas(scratch, delta_count, first, lane_totals, (uint64_t*)out);
     return true;
 }
 

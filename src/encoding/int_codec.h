@@ -73,7 +73,11 @@ sx_err sx_int64_encode(const int64_t* values, uint32_t count, sx_byte_writer* ou
 sx_err sx_int64_encode_as(sx_encoding encoding, const int64_t* values, uint32_t count,
                           sx_byte_writer* out);
 
-/* Decodes `count` values into `out`, which must hold SX_VECTOR_SIZE values. */
+/*
+ * Decodes `count` values into `out`, which must hold SX_VECTOR_SIZE values. FOR_BITPACK and
+ * the delta encodings may also overwrite values after the first `count`, up to
+ * sx_bitpack_padded_count(count) values.
+ */
 sx_err sx_int64_decode(sx_encoding encoding, const uint8_t* data, size_t size, uint32_t count,
                        int64_t* out);
 

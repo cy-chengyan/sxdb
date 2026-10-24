@@ -5,10 +5,12 @@
 #include "common/bits.h"
 #include "common/compiler.h"
 #include "common/rng.h"
+#include "encoding/bitpack.h"
 #include "encoding/int_codec.h"
 
 #include <stdbool.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define NANOS_PER_MILLI INT64_C(1000000)
 #define BASE_TIME_NS    (INT64_C(1792137600) * INT64_C(1000000000))
@@ -176,8 +178,13 @@ static void test_forced_encodings_round_trip(void) {
             sx_writer_init(&writer, buffer, sizeof(buffer));
             SX_CHECK(sx_int64_encode_as(encodings[e], values, count, &writer) == SX_OK);
             int64_t decoded[SX_VECTOR_SIZE];
+            memset(decoded, 0xA5, sizeof(decoded));
             SX_CHECK(sx_int64_decode(encodings[e], buffer, writer.size, count, decoded) == SX_OK);
             SX_CHECK_EQ_MEM(decoded, values, count * sizeof(int64_t));
+            /* Padding may be written, but nothing past the padded count. */
+            for (uint32_t i = sx_bitpack_padded_count(count); i < SX_VECTOR_SIZE; i++) {
+                SX_CHECK_EQ_U64((uint64_t)decoded[i], UINT64_C(0xA5A5A5A5A5A5A5A5));
+            }
         }
     }
 
@@ -322,6 +329,37 @@ static void test_patched_corruption_is_rejected(void) {
              SX_ERR_CORRUPT);
 }
 
+/* Exceptions may come in any order and repeat a position; the last one of a slot wins. */
+static void test_patched_exceptions_in_any_order(void) {
+    static const uint16_t positions[] = {3, 1, 3};
+    static const uint64_t offsets[] = {5, 7, 9};
+    uint8_t buffer[128];
+    sx_byte_writer writer;
+    sx_writer_init(&writer, buffer, sizeof(buffer));
+    sx_writer_put_i64(&writer, 1000); /* first */
+    sx_writer_put_i64(&writer, 10);   /* delta_base */
+    sx_writer_put_u64(&writer, 1);    /* multiplier */
+    sx_writer_put_u8(&writer, 0);     /* width: every packed offset is 0 */
+    sx_writer_reserve_zeroed(&writer, 1);
+    sx_writer_put_u16(&writer, (uint16_t)SX_ARRAY_SIZE(positions));
+    sx_writer_reserve_zeroed(&writer, 4);
+    for (size_t i = 0; i < SX_ARRAY_SIZE(positions); i++) {
+        sx_writer_put_u16(&writer, positions[i]);
+    }
+    sx_writer_pad_to(&writer, 8);
+    for (size_t i = 0; i < SX_ARRAY_SIZE(offsets); i++) {
+        sx_writer_put_u64(&writer, offsets[i]);
+    }
+    SX_CHECK(!writer.overflow);
+
+    /* The deltas are 10, 17, 10, and 19. */
+    static const int64_t expected[] = {1000, 1010, 1027, 1037, 1056};
+    int64_t decoded[SX_VECTOR_SIZE];
+    SX_CHECK(sx_int64_decode(SX_ENCODING_DELTA_PATCHED, buffer, writer.size,
+                             (uint32_t)SX_ARRAY_SIZE(expected), decoded) == SX_OK);
+    SX_CHECK_EQ_MEM(decoded, expected, sizeof(expected));
+}
+
 static void test_random_payloads_never_crash(void) {
     sx_rng rng;
     sx_rng_seed(&rng, 6);
@@ -464,6 +502,7 @@ static const sx_test_case cases[] = {
     {"patched_extreme_jumps", test_patched_extreme_jumps_round_trip},
     {"common_multipliers", test_common_multipliers_round_trip},
     {"patched_corruption", test_patched_corruption_is_rejected},
+    {"patched_exceptions_in_any_order", test_patched_exceptions_in_any_order},
     {"random_payloads", test_random_payloads_never_crash},
     {"delta_encodings_every_count", test_delta_encodings_every_count},
     {"for_multiplier_is_gcd", test_for_multiplier_is_gcd_of_offsets},

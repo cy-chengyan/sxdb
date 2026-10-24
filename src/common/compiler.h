@@ -33,6 +33,7 @@
 #define SX_UNLIKELY(x) __builtin_expect(!!(x), 0)
 
 #define SX_NOINLINE                  __attribute__((noinline))
+#define SX_ALWAYS_INLINE             inline __attribute__((always_inline))
 #define SX_NODISCARD                 __attribute__((warn_unused_result))
 #define SX_PRINTF_FORMAT(fmt, first) __attribute__((format(printf, fmt, first)))
 #define SX_ALIGNED(bytes)            __attribute__((aligned(bytes)))

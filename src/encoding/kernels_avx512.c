@@ -118,28 +118,62 @@ static void bitunpack_avx512(const uint8_t* packed, uint32_t count, uint32_t wid
     }
 }
 
-static void decode_for_avx512(const uint8_t* packed, uint32_t count, uint32_t width, uint64_t base,
-                              uint64_t multiplier, uint64_t* out) {
-    __m512i mask = _mm512_set1_epi64((long long)sx_low_mask_u64(width));
-    __m512i base_vector = _mm512_set1_epi64((long long)base);
-    __m512i multiplier_vector = _mm512_set1_epi64((long long)multiplier);
-    /* Offsets below 2^32 times a multiplier below 2^32 need one 32x32->64 product. */
-    bool narrow = width <= 32u && multiplier <= UINT32_MAX;
+/* Broadcast constants of frame-of-reference decoding. */
+typedef struct for_constants {
+    __m512i mask;
+    __m512i base;
+    __m512i multiplier;
+} for_constants;
+
+static inline for_constants make_for_constants(uint32_t width, uint64_t base, uint64_t multiplier) {
+    for_constants c = {
+        .mask = _mm512_set1_epi64((long long)sx_low_mask_u64(width)),
+        .base = _mm512_set1_epi64((long long)base),
+        .multiplier = _mm512_set1_epi64((long long)multiplier),
+    };
+    return c;
+}
+
+/* Decodes row `row`: base + unpacked * multiplier. */
+static SX_ALWAYS_INLINE void decode_row(const uint8_t* packed, uint32_t row, uint32_t width,
+                                        const for_constants* c, sx_multiply_kind kind, __m512i* v) {
+    unpack_or_zero_row(packed, row, width, c->mask, v);
+    for (uint32_t q = 0; q < VECTORS_PER_ROW; q++) {
+        if (kind == SX_MULTIPLY_NARROW) {
+            v[q] = _mm512_mul_epu32(v[q], c->multiplier);
+        } else if (kind == SX_MULTIPLY_WIDE) {
+            v[q] = _mm512_mullo_epi64(v[q], c->multiplier);
+        }
+        v[q] = _mm512_add_epi64(v[q], c->base);
+    }
+}
+
+static SX_ALWAYS_INLINE void decode_for_rows(const uint8_t* packed, uint32_t count, uint32_t width,
+                                             const for_constants* c, sx_multiply_kind kind,
+                                             uint64_t* out) {
     __m512i v[VECTORS_PER_ROW];
     for (uint32_t row = 0; row < sx_bitpack_rows(count); row++) {
-        unpack_or_zero_row(packed, row, width, mask, v);
+        decode_row(packed, row, width, c, kind, v);
         uint64_t* dst = out + (size_t)row * SX_BITPACK_LANES;
-        for (uint32_t q = 0; q < VECTORS_PER_ROW; q++) {
-            __m512i product;
-            if (multiplier == 1) {
-                product = v[q];
-            } else if (narrow) {
-                product = _mm512_mul_epu32(v[q], multiplier_vector);
-            } else {
-                product = _mm512_mullo_epi64(v[q], multiplier_vector);
-            }
-            _mm512_storeu_si512(dst + q * VECTOR_LANES, _mm512_add_epi64(product, base_vector));
-        }
+        _mm512_storeu_si512(dst, v[0]);
+        _mm512_storeu_si512(dst + VECTOR_LANES, v[1]);
+    }
+}
+
+/* Each kind of multiplication gets its own copy of the loop. */
+static void decode_for_avx512(const uint8_t* packed, uint32_t count, uint32_t width, uint64_t base,
+                              uint64_t multiplier, uint64_t* out) {
+    for_constants c = make_for_constants(width, base, multiplier);
+    switch (sx_multiply_kind_of(width, multiplier)) {
+        case SX_MULTIPLY_NONE:
+            decode_for_rows(packed, count, width, &c, SX_MULTIPLY_NONE, out);
+            break;
+        case SX_MULTIPLY_NARROW:
+            decode_for_rows(packed, count, width, &c, SX_MULTIPLY_NARROW, out);
+            break;
+        default:
+            decode_for_rows(packed, count, width, &c, SX_MULTIPLY_WIDE, out);
+            break;
     }
 }
 
@@ -191,92 +225,95 @@ static inline void transpose_8x8(__m512i* m) {
     m[7] = _mm512_shuffle_i64x2(u3, u7, 0xdd);
 }
 
-/* Stores the eight values of a lane block, or only those that belong to the lane. */
-static inline void store_lane_block(uint64_t* dst, uint32_t lane_slots, uint32_t row,
-                                    __m512i values) {
-    if (lane_slots >= row + 8u) {
-        _mm512_storeu_si512(dst, values);
-    } else if (lane_slots > row) {
-        __mmask8 valid = (__mmask8)((1u << (lane_slots - row)) - 1u);
-        _mm512_mask_storeu_epi64(dst, valid, values);
+static void zero_rows(uint64_t* rows, uint32_t count) {
+    for (uint32_t i = 0; i < count * VECTORS_PER_ROW; i++) {
+        _mm512_storeu_si512(rows + i * VECTOR_LANES, _mm512_setzero_si512());
+    }
+}
+
+/* Decodes the deltas into scratch rows 1 to `rows` and sums up each lane on the way. */
+static SX_ALWAYS_INLINE void decode_deltas_rows(const uint8_t* packed, uint32_t rows,
+                                                uint32_t width, const for_constants* c,
+                                                sx_multiply_kind kind, uint64_t* scratch,
+                                                uint64_t* lane_totals) {
+    __m512i totals[VECTORS_PER_ROW] = {_mm512_setzero_si512(), _mm512_setzero_si512()};
+    __m512i v[VECTORS_PER_ROW];
+    uint64_t* dst = scratch + SX_BITPACK_LANES;
+    for (uint32_t row = 0; row < rows; row++) {
+        decode_row(packed, row, width, c, kind, v);
+        for (uint32_t q = 0; q < VECTORS_PER_ROW; q++) {
+            _mm512_storeu_si512(dst + q * VECTOR_LANES, v[q]);
+            totals[q] = _mm512_add_epi64(totals[q], v[q]);
+        }
+        dst += SX_BITPACK_LANES;
+    }
+    _mm512_storeu_si512(lane_totals, totals[0]);
+    _mm512_storeu_si512(lane_totals + VECTOR_LANES, totals[1]);
+}
+
+static void decode_deltas_avx512(const uint8_t* packed, uint32_t slot_count, uint32_t width,
+                                 uint64_t base, uint64_t multiplier, uint64_t* scratch,
+                                 uint64_t* lane_totals) {
+    uint32_t rows = sx_bitpack_rows(slot_count);
+    for_constants c = make_for_constants(width, base, multiplier);
+    zero_rows(scratch, 1);
+    switch (sx_multiply_kind_of(width, multiplier)) {
+        case SX_MULTIPLY_NONE:
+            decode_deltas_rows(packed, rows, width, &c, SX_MULTIPLY_NONE, scratch, lane_totals);
+            break;
+        case SX_MULTIPLY_NARROW:
+            decode_deltas_rows(packed, rows, width, &c, SX_MULTIPLY_NARROW, scratch, lane_totals);
+            break;
+        default:
+            decode_deltas_rows(packed, rows, width, &c, SX_MULTIPLY_WIDE, scratch, lane_totals);
+            break;
+    }
+    uint32_t last_row = sx_delta_scratch_last_row(rows);
+    if (last_row > rows) {
+        zero_rows(scratch + (size_t)(rows + 1u) * SX_BITPACK_LANES, last_row - rows);
     }
 }
 
 /*
  * Each lane holds a run of consecutive slots, so the lanes are summed independently:
- * running sums go down the rows, starting from each lane's first value, and each 8x8
- * block (eight rows of eight lanes) is transposed so that a lane's eight values become
- * one vector stored in place.
+ * running sums go down the rows from each lane's start, and each 8x8 block (eight rows of
+ * eight lanes) is transposed so that a lane's eight values become one vector stored in
+ * place. A last block of fewer than eight rows is stored with a mask, so that it does not
+ * run into the next lane.
  */
-static void rebuild_deltas_avx512(const uint64_t* deltas, uint32_t slot_count, uint64_t first,
-                                  uint64_t* out) {
+static void rebuild_deltas_avx512(const uint64_t* scratch, uint32_t slot_count, uint64_t first,
+                                  const uint64_t* lane_totals, uint64_t* out) {
     uint32_t rows = sx_bitpack_rows(slot_count);
-    /* Lane totals, with two sums per half so that the additions do not wait on each other. */
-    __m512i even[VECTORS_PER_ROW] = {_mm512_setzero_si512(), _mm512_setzero_si512()};
-    __m512i odd[VECTORS_PER_ROW] = {_mm512_setzero_si512(), _mm512_setzero_si512()};
-    uint32_t row = 0;
-    for (; row + 2u <= rows; row += 2u) {
-        const uint64_t* src = deltas + (size_t)row * SX_BITPACK_LANES;
-        for (uint32_t h = 0; h < VECTORS_PER_ROW; h++) {
-            even[h] = _mm512_add_epi64(even[h], _mm512_loadu_si512(src + h * VECTOR_LANES));
-            odd[h] = _mm512_add_epi64(
-                odd[h], _mm512_loadu_si512(src + SX_BITPACK_LANES + h * VECTOR_LANES));
-        }
-    }
-    if (row < rows) {
-        const uint64_t* src = deltas + (size_t)row * SX_BITPACK_LANES;
-        for (uint32_t h = 0; h < VECTORS_PER_ROW; h++) {
-            even[h] = _mm512_add_epi64(even[h], _mm512_loadu_si512(src + h * VECTOR_LANES));
-        }
-    }
-    uint64_t lane_totals[SX_BITPACK_LANES];
+    uint64_t starts[SX_BITPACK_LANES];
+    uint64_t end = sx_delta_lane_starts(lane_totals, first, starts);
+    uint32_t blocks = (rows + 7u) / 8u;
+    __mmask8 last_mask = (__mmask8)(0xffu >> (blocks * 8u - rows)); /* rows in the last block */
     for (uint32_t h = 0; h < VECTORS_PER_ROW; h++) {
-        _mm512_storeu_si512(lane_totals + h * VECTOR_LANES, _mm512_add_epi64(even[h], odd[h]));
-    }
-
-    /* Lane l starts after all slots of the lanes before it; lanes fill up in order. */
-    uint64_t lane_starts[SX_BITPACK_LANES];
-    uint32_t lane_slots[SX_BITPACK_LANES];
-    uint64_t start = first;
-    for (uint32_t lane = 0; lane < SX_BITPACK_LANES; lane++) {
-        uint32_t before = lane * rows;
-        lane_starts[lane] = start;
-        lane_slots[lane] = 0;
-        if (slot_count > before) {
-            lane_slots[lane] = slot_count - before < rows ? slot_count - before : rows;
-        }
-        start += lane_totals[lane];
-    }
-    uint32_t full_lanes = slot_count / rows;
-
-    out[0] = first;
-    uint64_t* values = out + 1;
-    for (uint32_t h = 0; h < VECTORS_PER_ROW; h++) {
-        uint32_t first_lane = h * VECTOR_LANES;
-        __m512i running = _mm512_loadu_si512(lane_starts + first_lane);
-        for (row = 0; row < rows; row += 8u) {
-            uint32_t block_rows = rows - row < 8u ? rows - row : 8u;
-            __m512i block[8];
+        __m512i running = _mm512_loadu_si512(starts + h * VECTOR_LANES);
+        const uint64_t* src = scratch + h * VECTOR_LANES;
+        uint64_t* dst = out + h * VECTOR_LANES * rows;
+        for (uint32_t block = 0; block < blocks; block++) {
+            __m512i m[8];
             for (uint32_t j = 0; j < 8u; j++) {
-                if (j < block_rows) {
-                    const uint64_t* src = deltas + (size_t)(row + j) * SX_BITPACK_LANES;
-                    running = _mm512_add_epi64(running, _mm512_loadu_si512(src + first_lane));
-                }
-                block[j] = running;
+                running = _mm512_add_epi64(running, _mm512_loadu_si512(src));
+                src += SX_BITPACK_LANES;
+                m[j] = running;
             }
-            transpose_8x8(block);
-            uint64_t* dst = values + (size_t)first_lane * rows + row;
-            if (block_rows == 8u && first_lane + VECTOR_LANES <= full_lanes) {
+            transpose_8x8(m);
+            if (block + 1u < blocks) {
                 for (uint32_t i = 0; i < 8u; i++) {
-                    _mm512_storeu_si512(dst + (size_t)i * rows, block[i]);
+                    _mm512_storeu_si512(dst + (size_t)i * rows, m[i]);
                 }
             } else {
                 for (uint32_t i = 0; i < 8u; i++) {
-                    store_lane_block(dst + (size_t)i * rows, lane_slots[first_lane + i], row,
-                                     block[i]);
+                    _mm512_mask_storeu_epi64(dst + (size_t)i * rows, last_mask, m[i]);
                 }
             }
+            dst += 8;
         }
+    }
+    if (slot_count == SX_BITPACK_LANES * rows) {
+        out[SX_BITPACK_LANES * rows] = end;
     }
 }
 
@@ -611,6 +648,7 @@ const sx_codec_kernels sx_kernels_avx512 = {
     .bitunpack = bitunpack_avx512,
     .decode_for = decode_for_avx512,
     .decode_alp = decode_alp_avx512,
+    .decode_deltas = decode_deltas_avx512,
     .rebuild_deltas = rebuild_deltas_avx512,
     .encode_alp = encode_alp_avx512,
     .summarize_ints = summarize_ints_avx512,

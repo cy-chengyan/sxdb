@@ -209,33 +209,140 @@ static void test_decode_alp_matches_scalar(void) {
     }
 }
 
+/* Values of `scratch` that decode_deltas writes: rows 0 to the last one rebuild_deltas reads. */
+static size_t delta_scratch_values(uint32_t slot_count) {
+    uint32_t rows = sx_bitpack_rows(slot_count);
+    uint32_t last_row = sx_delta_scratch_last_row(rows);
+    return (size_t)((last_row > rows ? last_row : rows) + 1u) * SX_BITPACK_LANES;
+}
+
+/* The portable decode_deltas against its contract: decode_for rows behind a zero row. */
+static bool check_decode_deltas_layout(const uint64_t* scratch, const uint64_t* lane_totals,
+                                       const uint8_t* packed, uint32_t slot_count, uint32_t width,
+                                       uint64_t base, uint64_t multiplier) {
+    const sx_codec_kernels* scalar = level_kernels(SX_SIMD_SCALAR);
+    uint64_t deltas[SX_VECTOR_SIZE];
+    scalar->decode_for(packed, slot_count, width, base, multiplier, deltas);
+    uint32_t rows = sx_bitpack_rows(slot_count);
+    uint64_t totals[SX_BITPACK_LANES] = {0};
+    for (size_t i = 0; i < delta_scratch_values(slot_count); i++) {
+        size_t row = i / SX_BITPACK_LANES;
+        bool delta_row = row >= 1u && row <= rows;
+        uint64_t expected = delta_row ? deltas[i - SX_BITPACK_LANES] : 0;
+        if (scratch[i] != expected) {
+            sx_test_fail(__FILE__, __LINE__, "scalar decode_deltas value %zu wrong: %u slots", i,
+                         slot_count);
+            return false;
+        }
+        totals[i % SX_BITPACK_LANES] += expected;
+    }
+    if (memcmp(totals, lane_totals, sizeof(totals)) != 0) {
+        sx_test_fail(__FILE__, __LINE__, "scalar decode_deltas totals wrong: %u slots", slot_count);
+        return false;
+    }
+    return true;
+}
+
+static void test_decode_deltas_matches_scalar(void) {
+    const sx_codec_kernels* scalar = level_kernels(SX_SIMD_SCALAR);
+    sx_simd_level levels[SX_SIMD_LEVEL_COUNT];
+    uint32_t level_count = simd_levels(levels);
+    sx_rng rng;
+    sx_rng_seed(&rng, 8);
+    uint8_t packed[MAX_PACKED];
+    uint64_t expected[SX_DELTA_SCRATCH_SIZE];
+    uint64_t actual[SX_DELTA_SCRATCH_SIZE];
+    uint64_t expected_totals[SX_BITPACK_LANES];
+    uint64_t actual_totals[SX_BITPACK_LANES];
+    uint32_t round = 0;
+    for (uint32_t width = 0; width <= 64; width++) {
+        for (size_t c = 0; c < SX_ARRAY_SIZE(counts); c++) {
+            uint32_t slot_count = counts[c] < SX_VECTOR_SIZE ? counts[c] : SX_VECTOR_SIZE - 1u;
+            fill_random(&rng, packed, sx_bitpack_size(slot_count, width));
+            uint64_t base = sx_rng_next(&rng);
+            uint64_t multiplier = pick_multiplier(&rng, round);
+            round++;
+            /* Different garbage before each call: every value written is compared. */
+            memset(expected, 0x5A, sizeof(expected));
+            scalar->decode_deltas(packed, slot_count, width, base, multiplier, expected,
+                                  expected_totals);
+            if (!check_decode_deltas_layout(expected, expected_totals, packed, slot_count, width,
+                                            base, multiplier)) {
+                return;
+            }
+            size_t size = delta_scratch_values(slot_count) * sizeof(uint64_t);
+            for (uint32_t l = 0; l < level_count; l++) {
+                memset(actual, 0xA5, sizeof(actual));
+                level_kernels(levels[l])->decode_deltas(packed, slot_count, width, base, multiplier,
+                                                        actual, actual_totals);
+                if (memcmp(actual, expected, size) != 0 ||
+                    memcmp(actual_totals, expected_totals, sizeof(expected_totals)) != 0) {
+                    sx_test_fail(
+                        __FILE__, __LINE__,
+                        "%s decode_deltas differs: width %u, %u slots, multiplier %" PRIu64,
+                        sx_simd_level_name(levels[l]), width, slot_count, multiplier);
+                    return;
+                }
+            }
+        }
+    }
+}
+
 static void test_rebuild_deltas_matches_scalar(void) {
     const sx_codec_kernels* scalar = level_kernels(SX_SIMD_SCALAR);
     sx_simd_level levels[SX_SIMD_LEVEL_COUNT];
     uint32_t level_count = simd_levels(levels);
     sx_rng rng;
     sx_rng_seed(&rng, 4);
-    uint64_t deltas[SX_VECTOR_SIZE];
-    uint64_t expected[SX_VECTOR_SIZE + 1];
-    uint64_t actual[SX_VECTOR_SIZE + 1];
+    static uint64_t scratch[SX_DELTA_SCRATCH_SIZE];
+    uint64_t lane_totals[SX_BITPACK_LANES];
+    uint64_t expected[SX_VECTOR_SIZE + 16];
+    uint64_t actual[SX_VECTOR_SIZE + 16];
     for (uint32_t slot_count = 1; slot_count < SX_VECTOR_SIZE; slot_count++) {
-        /* Padding slots hold garbage too: it must never reach the output. */
-        fill_random(&rng, deltas, sizeof(deltas));
+        uint32_t rows = sx_bitpack_rows(slot_count);
+        /* Row 0 is zero, as decode_deltas leaves it; the padding and the rows after the last
+         * hold garbage, which must not reach the first slot_count + 1 values. */
+        fill_random(&rng, scratch, sizeof(scratch));
+        memset(scratch, 0, SX_BITPACK_ROW_BYTES);
+        memset(lane_totals, 0, sizeof(lane_totals));
+        for (size_t i = SX_BITPACK_LANES; i < (size_t)(rows + 1u) * SX_BITPACK_LANES; i++) {
+            lane_totals[i % SX_BITPACK_LANES] += scratch[i];
+        }
         uint64_t first = sx_rng_next(&rng);
-        scalar->rebuild_deltas(deltas, slot_count, first, expected);
+        size_t written =
+            slot_count + 1u > SX_BITPACK_LANES * rows ? slot_count + 1u : SX_BITPACK_LANES * rows;
+        memset(expected, 0x5A, sizeof(expected));
+        scalar->rebuild_deltas(scratch, slot_count, first, lane_totals, expected);
+
+        /* out[0] = first and out[i + 1] = out[i] + delta of slot i. */
+        uint64_t value = first;
+        SX_CHECK_EQ_U64(expected[0], first);
+        for (uint32_t i = 0; i < slot_count; i++) {
+            value += scratch[SX_BITPACK_LANES + sx_bitpack_lane_position(i, rows)];
+            if (expected[i + 1u] != value) {
+                sx_test_fail(__FILE__, __LINE__, "scalar rebuild_deltas value %u wrong: %u slots",
+                             i + 1u, slot_count);
+                return;
+            }
+        }
+        SX_CHECK(written <= SX_VECTOR_SIZE);
+        for (size_t i = written; i < SX_ARRAY_SIZE(expected); i++) {
+            SX_CHECK_EQ_U64(expected[i], UINT64_C(0x5A5A5A5A5A5A5A5A));
+        }
+
         for (uint32_t l = 0; l < level_count; l++) {
-            /* Values past the end must be left alone. */
             memset(actual, 0xA5, sizeof(actual));
-            level_kernels(levels[l])->rebuild_deltas(deltas, slot_count, first, actual);
-            if (memcmp(actual, expected, (slot_count + 1u) * sizeof(uint64_t)) != 0) {
+            level_kernels(levels[l])->rebuild_deltas(scratch, slot_count, first, lane_totals,
+                                                     actual);
+            if (memcmp(actual, expected, written * sizeof(uint64_t)) != 0) {
                 sx_test_fail(__FILE__, __LINE__, "%s rebuild_deltas differs: %u slots",
                              sx_simd_level_name(levels[l]), slot_count);
                 return;
             }
-            for (uint32_t i = slot_count + 1u; i < SX_VECTOR_SIZE + 1u; i++) {
+            for (size_t i = written; i < SX_ARRAY_SIZE(actual); i++) {
                 if (actual[i] != UINT64_C(0xA5A5A5A5A5A5A5A5)) {
-                    sx_test_fail(__FILE__, __LINE__, "%s rebuild_deltas wrote value %u of %u",
-                                 sx_simd_level_name(levels[l]), i, slot_count + 1u);
+                    sx_test_fail(__FILE__, __LINE__, "%s rebuild_deltas wrote value %zu of %zu",
+                                 sx_simd_level_name(levels[l]), i, written);
                     return;
                 }
             }
@@ -743,6 +850,7 @@ static const sx_test_case cases[] = {
     {"bitpack_matches_scalar", test_bitpack_matches_scalar},
     {"unpack_and_decode_for_match_scalar", test_unpack_and_decode_for_match_scalar},
     {"decode_alp_matches_scalar", test_decode_alp_matches_scalar},
+    {"decode_deltas_matches_scalar", test_decode_deltas_matches_scalar},
     {"rebuild_deltas_matches_scalar", test_rebuild_deltas_matches_scalar},
     {"encode_alp_matches_scalar", test_encode_alp_matches_scalar},
     {"summarize_ints_matches_scalar", test_summarize_ints_matches_scalar},

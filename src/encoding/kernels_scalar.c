@@ -44,25 +44,28 @@ static void bitpack_scalar(const uint64_t* values, uint32_t count, uint32_t widt
     }
 }
 
+/* Value `lane` of row `row` of a block packed at `width` > 0 bits. */
+static uint64_t unpack_value(const uint8_t* packed, uint32_t row, uint32_t lane, uint32_t width) {
+    uint64_t bit_position = (uint64_t)row * width;
+    uint32_t offset = (uint32_t)(bit_position % 64u);
+    const uint8_t* low =
+        packed + (bit_position / 64u) * SX_BITPACK_ROW_BYTES + lane * sizeof(uint64_t);
+    uint64_t value = sx_load_u64(low) >> offset;
+    if (offset + width > 64u) {
+        value |= sx_load_u64(low + SX_BITPACK_ROW_BYTES) << (64u - offset);
+    }
+    return value & sx_low_mask_u64(width);
+}
+
 static void bitunpack_scalar(const uint8_t* packed, uint32_t count, uint32_t width, uint64_t* out) {
     uint32_t rows = sx_bitpack_rows(count);
     if (width == 0) {
         memset(out, 0, (size_t)rows * SX_BITPACK_ROW_BYTES);
         return;
     }
-    uint64_t mask = sx_low_mask_u64(width);
     for (uint32_t row = 0; row < rows; row++) {
-        uint64_t bit_position = (uint64_t)row * width;
-        uint32_t offset = (uint32_t)(bit_position % 64u);
-        const uint8_t* low_words = packed + (bit_position / 64u) * SX_BITPACK_ROW_BYTES;
-        uint64_t* dst = out + (size_t)row * SX_BITPACK_LANES;
         for (uint32_t lane = 0; lane < SX_BITPACK_LANES; lane++) {
-            uint64_t value = sx_load_u64(low_words + lane * sizeof(uint64_t)) >> offset;
-            if (offset + width > 64u) {
-                const uint8_t* high = low_words + SX_BITPACK_ROW_BYTES + lane * sizeof(uint64_t);
-                value |= sx_load_u64(high) << (64u - offset);
-            }
-            dst[lane] = value & mask;
+            out[(size_t)row * SX_BITPACK_LANES + lane] = unpack_value(packed, row, lane, width);
         }
     }
 }
@@ -84,19 +87,43 @@ static void decode_alp_scalar(const uint8_t* packed, uint32_t count, uint32_t wi
     }
 }
 
-static void rebuild_deltas_scalar(const uint64_t* deltas, uint32_t slot_count, uint64_t first,
-                                  uint64_t* out) {
+static void decode_deltas_scalar(const uint8_t* packed, uint32_t slot_count, uint32_t width,
+                                 uint64_t base, uint64_t multiplier, uint64_t* scratch,
+                                 uint64_t* lane_totals) {
     uint32_t rows = sx_bitpack_rows(slot_count);
-    uint64_t value = first;
-    out[0] = value;
-    /* Slots in order: lane by lane, and down the rows within a lane. */
-    uint32_t slot = 0;
-    for (uint32_t lane = 0; lane < SX_BITPACK_LANES && slot < slot_count; lane++) {
-        for (uint32_t row = 0; row < rows && slot < slot_count; row++) {
-            value += deltas[(size_t)row * SX_BITPACK_LANES + lane];
-            slot++;
-            out[slot] = value;
+    uint64_t totals[SX_BITPACK_LANES] = {0};
+    memset(scratch, 0, SX_BITPACK_ROW_BYTES);
+    for (uint32_t row = 0; row < rows; row++) {
+        uint64_t* dst = scratch + (size_t)(row + 1u) * SX_BITPACK_LANES;
+        for (uint32_t lane = 0; lane < SX_BITPACK_LANES; lane++) {
+            uint64_t offset = width == 0 ? 0 : unpack_value(packed, row, lane, width);
+            dst[lane] = base + offset * multiplier;
+            totals[lane] += dst[lane];
         }
+    }
+    uint32_t last_row = sx_delta_scratch_last_row(rows);
+    if (last_row > rows) {
+        memset(scratch + (size_t)(rows + 1u) * SX_BITPACK_LANES, 0,
+               (size_t)(last_row - rows) * SX_BITPACK_ROW_BYTES);
+    }
+    memcpy(lane_totals, totals, sizeof(totals));
+}
+
+static void rebuild_deltas_scalar(const uint64_t* scratch, uint32_t slot_count, uint64_t first,
+                                  const uint64_t* lane_totals, uint64_t* out) {
+    uint32_t rows = sx_bitpack_rows(slot_count);
+    uint64_t starts[SX_BITPACK_LANES];
+    uint64_t end = sx_delta_lane_starts(lane_totals, first, starts);
+    /* Lane by lane, down the rows; scratch row 0 is zero, so out[lane * rows] is the start. */
+    for (uint32_t lane = 0; lane < SX_BITPACK_LANES; lane++) {
+        uint64_t value = starts[lane];
+        for (uint32_t j = 0; j < rows; j++) {
+            value += scratch[(size_t)j * SX_BITPACK_LANES + lane];
+            out[(size_t)lane * rows + j] = value;
+        }
+    }
+    if (slot_count == SX_BITPACK_LANES * rows) {
+        out[SX_BITPACK_LANES * rows] = end;
     }
 }
 
@@ -210,6 +237,7 @@ const sx_codec_kernels sx_kernels_scalar = {
     .bitunpack = bitunpack_scalar,
     .decode_for = decode_for_scalar,
     .decode_alp = decode_alp_scalar,
+    .decode_deltas = decode_deltas_scalar,
     .rebuild_deltas = rebuild_deltas_scalar,
     .encode_alp = encode_alp_scalar,
     .summarize_ints = summarize_ints_scalar,
