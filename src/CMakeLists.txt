@@ -26,13 +26,18 @@ add_library(sxdb STATIC
 
 # SIMD codec kernels. Each instruction set lives in its own file, compiled with the flags
 # for that set only; kernels.c calls them after checking the CPU (see encoding/kernels.h).
+# The x86_64 sets are the integer instructions of the x86-64-v3 and x86-64-v4 levels,
+# spelled out because GCC before 11 does not know the level names.
 if(SXDB_SIMD)
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+        set(sxdb_x86_64_v3_flags -mavx2 -mbmi -mbmi2 -mlzcnt -mpopcnt)
+        set(sxdb_x86_64_v4_flags ${sxdb_x86_64_v3_flags}
+            -mavx512f -mavx512cd -mavx512bw -mavx512dq -mavx512vl)
         target_sources(sxdb PRIVATE encoding/kernels_avx2.c encoding/kernels_avx512.c)
         set_source_files_properties(encoding/kernels_avx2.c
-            PROPERTIES COMPILE_OPTIONS "-mavx2")
+            PROPERTIES COMPILE_OPTIONS "${sxdb_x86_64_v3_flags}")
         set_source_files_properties(encoding/kernels_avx512.c
-            PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512dq")
+            PROPERTIES COMPILE_OPTIONS "${sxdb_x86_64_v4_flags}")
         target_compile_definitions(sxdb PRIVATE SX_SIMD_KERNELS)
     elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
         target_sources(sxdb PRIVATE encoding/kernels_neon.c)

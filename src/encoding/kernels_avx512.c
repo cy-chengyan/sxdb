@@ -1,14 +1,16 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * AVX-512 codec kernels (x86_64, AVX-512 F and DQ). This file is compiled with
- * -mavx512f -mavx512dq and is only called after the CPU check in kernels.c. A row of 16
+ * AVX-512 codec kernels (x86_64, the x86-64-v4 level: AVX-512 F, CD, BW, DQ, and VL, plus
+ * the v3 integer extensions). This file is compiled for those instruction sets only (see
+ * src/CMakeLists.txt) and is only called after the CPU check in kernels.c. A row of 16
  * values is two 512-bit vectors of eight lanes. Every function computes exactly what its
  * portable counterpart in kernels_scalar.c computes; see kernels.h for the contracts.
  */
 
 #include "encoding/bitpack.h"
 #include "encoding/kernels.h"
+#include "encoding/kernels_int.h"
 
 #include "common/bits.h"
 #include "common/compiler.h"
@@ -343,6 +345,255 @@ static uint32_t encode_alp_avx512(const double* values, uint32_t count, const sx
     return exceptions;
 }
 
+/* Lanes of a vector that hold one of the `remaining` values from its start. */
+static inline __mmask8 first_lanes(uint32_t remaining) {
+    return remaining >= VECTOR_LANES ? (__mmask8)0xff : (__mmask8)((1u << remaining) - 1u);
+}
+
+/* The running minimums and maximums of summarize_ints. */
+typedef struct int_ranges {
+    __m512i min;
+    __m512i max;
+    __m512i delta_min;
+    __m512i delta_max;
+    uint32_t changes;
+} int_ranges;
+
+/* Adds the values of `valid` lanes at values + i, and their deltas, to the ranges. */
+static inline void add_to_ranges(const int64_t* values, uint32_t i, __mmask8 valid,
+                                 uint64_t* deltas, int_ranges* r) {
+    __m512i v = _mm512_maskz_loadu_epi64(valid, values + i);
+    __m512i previous = _mm512_maskz_loadu_epi64(valid, values + i - 1);
+    __m512i delta = _mm512_sub_epi64(v, previous);
+    _mm512_mask_storeu_epi64(deltas + i - 1, valid, delta);
+    r->min = _mm512_mask_min_epi64(r->min, valid, r->min, v);
+    r->max = _mm512_mask_max_epi64(r->max, valid, r->max, v);
+    r->delta_min = _mm512_mask_min_epi64(r->delta_min, valid, r->delta_min, delta);
+    r->delta_max = _mm512_mask_max_epi64(r->delta_max, valid, r->delta_max, delta);
+    r->changes += sx_popcount_u64(_mm512_mask_cmpneq_epi64_mask(valid, v, previous));
+}
+
+/*
+ * Each vector of values is subtracted from the same values loaded one element earlier,
+ * which gives eight deltas; the last vector is masked.
+ */
+static void summarize_ints_avx512(const int64_t* values, uint32_t count, uint64_t* deltas,
+                                  sx_int_summary* summary) {
+    sx_summary_start(values, count, summary);
+    int_ranges r = {
+        .min = _mm512_set1_epi64(summary->min),
+        .max = _mm512_set1_epi64(summary->max),
+        .delta_min = _mm512_set1_epi64(summary->delta_min),
+        .delta_max = _mm512_set1_epi64(summary->delta_max),
+        .changes = 0,
+    };
+    uint32_t i = 1;
+    for (; i + VECTOR_LANES <= count; i += VECTOR_LANES) {
+        add_to_ranges(values, i, 0xff, deltas, &r);
+    }
+    if (i < count) {
+        add_to_ranges(values, i, first_lanes(count - i), deltas, &r);
+    }
+    summary->min = _mm512_reduce_min_epi64(r.min);
+    summary->max = _mm512_reduce_max_epi64(r.max);
+    summary->delta_min = _mm512_reduce_min_epi64(r.delta_min);
+    summary->delta_max = _mm512_reduce_max_epi64(r.delta_max);
+    summary->changes = r.changes;
+}
+
+/* The constants of a multiple test, in vectors. */
+typedef struct multiple_vectors {
+    __m512i base;
+    __m512i shift;
+    __m512i inverse;
+    __m512i low_bits;
+    __m512i max_quotient;
+    bool multiply; /* false if the odd part of the divisor is 1: only low bits matter */
+} multiple_vectors;
+
+/*
+ * Lanes of `valid` whose number minus the base is not a multiple; writes the quotients of
+ * all valid lanes.
+ */
+static inline __mmask8 multiple_misses(const uint64_t* numbers, __mmask8 valid,
+                                       const multiple_vectors* t, uint64_t* quotients) {
+    __m512i x = _mm512_sub_epi64(_mm512_maskz_loadu_epi64(valid, numbers), t->base);
+    __m512i quotient = _mm512_srlv_epi64(x, t->shift);
+    __mmask8 misses = _mm512_mask_test_epi64_mask(valid, x, t->low_bits);
+    /* Zero is a multiple of every divisor; vectors of zeros skip the multiplication. */
+    if (t->multiply && _mm512_mask_test_epi64_mask(valid, x, x) != 0) {
+        quotient = _mm512_mullo_epi64(quotient, t->inverse);
+        misses |= _mm512_mask_cmpgt_epu64_mask(valid, quotient, t->max_quotient);
+    }
+    _mm512_mask_storeu_epi64(quotients, valid, quotient);
+    return misses;
+}
+
+static uint32_t first_non_multiple_avx512(const uint64_t* numbers, uint32_t start, uint32_t count,
+                                          uint64_t base, const sx_multiple_test* test,
+                                          uint64_t* quotients) {
+    multiple_vectors t = {
+        .base = _mm512_set1_epi64((long long)base),
+        .shift = _mm512_set1_epi64(test->exact.shift),
+        .inverse = _mm512_set1_epi64((long long)test->exact.inverse),
+        .low_bits = _mm512_set1_epi64((long long)test->low_bits),
+        .max_quotient = _mm512_set1_epi64((long long)test->max_quotient),
+        .multiply = test->max_quotient != UINT64_MAX,
+    };
+    uint32_t i = start;
+    for (; i + VECTOR_LANES <= count; i += VECTOR_LANES) {
+        uint32_t misses = multiple_misses(numbers + i, 0xff, &t, quotients + i);
+        if (misses != 0) {
+            return i + sx_trailing_zeros_u64(misses);
+        }
+    }
+    if (i < count) {
+        uint32_t misses = multiple_misses(numbers + i, first_lanes(count - i), &t, quotients + i);
+        if (misses != 0) {
+            return i + sx_trailing_zeros_u64(misses);
+        }
+    }
+    return count;
+}
+
+static inline void divide_vector(const uint64_t* numbers, __mmask8 valid, __m512i base,
+                                 __m512i shift, const __m512i* inverse, uint64_t* out) {
+    __m512i quotient =
+        _mm512_srlv_epi64(_mm512_sub_epi64(_mm512_maskz_loadu_epi64(valid, numbers), base), shift);
+    if (inverse != NULL) {
+        quotient = _mm512_mullo_epi64(quotient, *inverse);
+    }
+    _mm512_mask_storeu_epi64(out, valid, quotient);
+}
+
+static void divide_exact_avx512(const uint64_t* numbers, uint32_t count, uint64_t base,
+                                const sx_exact_divisor* divisor, uint64_t* out) {
+    __m512i base_vector = _mm512_set1_epi64((long long)base);
+    __m512i shift = _mm512_set1_epi64(divisor->shift);
+    __m512i inverse_vector = _mm512_set1_epi64((long long)divisor->inverse);
+    const __m512i* inverse = divisor->inverse != 1 ? &inverse_vector : NULL;
+    uint32_t i = 0;
+    for (; i + VECTOR_LANES <= count; i += VECTOR_LANES) {
+        divide_vector(numbers + i, 0xff, base_vector, shift, inverse, out + i);
+    }
+    if (i < count) {
+        divide_vector(numbers + i, first_lanes(count - i), base_vector, shift, inverse, out + i);
+    }
+}
+
+/*
+ * The leading zero counts (64 - width) of `present` (1 to 64) numbers, merged into the
+ * 64 bytes of one vector: one byte per number, in some order. Missing numbers count as
+ * zeros, with 64 leading zeros.
+ */
+static inline __m512i merged_leading_zeros(const uint64_t* numbers, uint32_t present) {
+    __m512i zeros = _mm512_setzero_si512();
+    for (uint32_t k = 0; k < 8u; k++) {
+        uint32_t first = k * (uint32_t)VECTOR_LANES;
+        __m512i x = _mm512_setzero_si512();
+        if (present >= first + VECTOR_LANES) {
+            x = _mm512_loadu_si512(numbers + first);
+        } else if (present > first) {
+            x = _mm512_maskz_loadu_epi64(first_lanes(present - first), numbers + first);
+        }
+        __m512i shift = _mm512_set1_epi64(8 * k);
+        zeros = _mm512_or_si512(zeros, _mm512_sllv_epi64(_mm512_lzcnt_epi64(x), shift));
+    }
+    return zeros;
+}
+
+/*
+ * The numbers are merged in blocks of 64 (merged_leading_zeros), and then the bytes of all
+ * blocks are counted for each width. The missing numbers of the last block are counted as
+ * width 0 and taken off at the end.
+ */
+static void width_counts_avx512(const uint64_t* numbers, uint32_t count, uint32_t max_width,
+                                uint32_t* counts) {
+    __m512i blocks[SX_VECTOR_SIZE / 64u];
+    uint32_t block_count = 0;
+    uint32_t first = 0;
+    for (; first + 64u <= count; first += 64u) {
+        blocks[block_count] = merged_leading_zeros(numbers + first, 64u);
+        block_count++;
+    }
+    if (first < count) {
+        blocks[block_count] = merged_leading_zeros(numbers + first, count - first);
+        block_count++;
+    }
+    __m512i target = _mm512_set1_epi8(64);
+    __m512i one = _mm512_set1_epi8(1);
+    for (uint32_t width = 0; width <= max_width; width++) {
+        uint32_t total = 0;
+        for (uint32_t b = 0; b < block_count; b++) {
+            total += sx_popcount_u64(_mm512_cmpeq_epi8_mask(blocks[b], target));
+        }
+        counts[width] = total;
+        target = _mm512_sub_epi8(target, one);
+    }
+    counts[0] -= block_count * 64u - count;
+}
+
+/* Copies offsets within the limit and returns the lanes of `valid` that exceed it. */
+static inline __mmask8 split_vector(const uint64_t* offsets, __mmask8 valid, __m512i limit,
+                                    uint64_t* packed) {
+    __m512i x = _mm512_maskz_loadu_epi64(valid, offsets);
+    __mmask8 wide = _mm512_mask_cmpgt_epu64_mask(valid, x, limit);
+    _mm512_mask_storeu_epi64(packed, valid, _mm512_maskz_mov_epi64((__mmask8)~wide, x));
+    return wide;
+}
+
+static uint32_t split_exceptions_avx512(const uint64_t* offsets, uint32_t count, uint64_t limit,
+                                        uint64_t* packed, uint16_t* positions,
+                                        uint64_t* exceptions) {
+    __m512i limit_vector = _mm512_set1_epi64((long long)limit);
+    uint32_t exception_count = 0;
+    for (uint32_t i = 0; i < count; i += VECTOR_LANES) {
+        uint32_t wide = split_vector(offsets + i, first_lanes(count - i), limit_vector, packed + i);
+        for (; wide != 0; wide &= wide - 1u) {
+            uint32_t index = i + sx_trailing_zeros_u64(wide);
+            positions[exception_count] = (uint16_t)index;
+            exceptions[exception_count] = offsets[index];
+            exception_count++;
+        }
+    }
+    return exception_count;
+}
+
+/*
+ * Each 8x8 block of the output (eight rows of eight lanes) comes from eight runs of eight
+ * values, one per lane, and is transposed from them. Blocks of full lanes are loaded
+ * directly; at the end of the lanes, missing values are loaded as zeros.
+ */
+static void to_lane_order_avx512(const uint64_t* values, uint32_t count, uint64_t* out) {
+    uint32_t rows = sx_bitpack_rows(count);
+    for (uint32_t first_lane = 0; first_lane < SX_BITPACK_LANES; first_lane += VECTOR_LANES) {
+        for (uint32_t row = 0; row < rows; row += 8u) {
+            bool full =
+                row + 8u <= rows && (first_lane + VECTOR_LANES - 1u) * rows + row + 8u <= count;
+            __m512i block[8];
+            for (uint32_t j = 0; j < 8u; j++) {
+                /* Values of lane first_lane + j in rows [row, row + 8). */
+                uint32_t start = (first_lane + j) * rows + row;
+                if (full) {
+                    block[j] = _mm512_loadu_si512(values + start);
+                    continue;
+                }
+                uint32_t in_lane = rows - row < 8u ? rows - row : 8u;
+                uint32_t available = start < count ? count - start : 0;
+                uint32_t present = available < in_lane ? available : in_lane;
+                block[j] = present == 0
+                               ? _mm512_setzero_si512()
+                               : _mm512_maskz_loadu_epi64(first_lanes(present), values + start);
+            }
+            transpose_8x8(block);
+            for (uint32_t j = 0; j < 8u && row + j < rows; j++) {
+                _mm512_storeu_si512(out + (size_t)(row + j) * SX_BITPACK_LANES + first_lane,
+                                    block[j]);
+            }
+        }
+    }
+}
+
 const sx_codec_kernels sx_kernels_avx512 = {
     .level = SX_SIMD_AVX512,
     .bitpack = bitpack_avx512,
@@ -351,6 +602,12 @@ const sx_codec_kernels sx_kernels_avx512 = {
     .decode_alp = decode_alp_avx512,
     .rebuild_deltas = rebuild_deltas_avx512,
     .encode_alp = encode_alp_avx512,
+    .summarize_ints = summarize_ints_avx512,
+    .first_non_multiple = first_non_multiple_avx512,
+    .divide_exact = divide_exact_avx512,
+    .width_counts = width_counts_avx512,
+    .split_exceptions = split_exceptions_avx512,
+    .to_lane_order = to_lane_order_avx512,
 };
 
 #endif /* SX_ARCH_X86_64 */

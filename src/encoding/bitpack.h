@@ -52,7 +52,10 @@ static inline size_t sx_bitpack_lane_position(uint32_t index, uint32_t rows) {
 }
 
 /* Size in bytes of `count` values packed at `width` bits (0 to 64). */
-size_t sx_bitpack_size(uint32_t count, uint32_t width);
+static inline size_t sx_bitpack_size(uint32_t count, uint32_t width) {
+    size_t words_per_lane = ((size_t)sx_bitpack_rows(count) * width + 63u) / 64u;
+    return words_per_lane * SX_BITPACK_ROW_BYTES;
+}
 
 /*
  * Packs the low `width` bits of each of the `count` values into `out`, which must hold

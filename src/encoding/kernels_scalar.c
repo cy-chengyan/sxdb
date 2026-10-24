@@ -7,6 +7,7 @@
 
 #include "encoding/bitpack.h"
 #include "encoding/kernels.h"
+#include "encoding/kernels_int.h"
 
 #include "common/bits.h"
 #include "common/compiler.h"
@@ -122,6 +123,71 @@ static uint32_t encode_alp_scalar(const double* values, uint32_t count, const sx
     return exceptions;
 }
 
+static void summarize_ints_scalar(const int64_t* values, uint32_t count, uint64_t* deltas,
+                                  sx_int_summary* summary) {
+    sx_summary_start(values, count, summary);
+    sx_summarize_ints_from(values, 1, count, deltas, summary);
+}
+
+/* Blocks of 16 numbers are tested with one branch, since nearly all numbers are multiples. */
+static uint32_t first_non_multiple_scalar(const uint64_t* numbers, uint32_t start, uint32_t count,
+                                          uint64_t base, const sx_multiple_test* test,
+                                          uint64_t* quotients) {
+    uint32_t i = start;
+    while (i + 16u <= count) {
+        uint64_t misses = 0;
+        for (uint32_t j = 0; j < 16u; j++) {
+            uint64_t x = numbers[i + j] - base;
+            quotients[i + j] = sx_divide_exact(x, &test->exact);
+            misses |= sx_multiple_miss(x, test);
+        }
+        if (misses != 0) {
+            break;
+        }
+        i += 16u;
+    }
+    return sx_first_non_multiple_from(numbers, i, count, base, test, quotients);
+}
+
+static void divide_exact_scalar(const uint64_t* numbers, uint32_t count, uint64_t base,
+                                const sx_exact_divisor* divisor, uint64_t* out) {
+    if (divisor->inverse == 1) {
+        /* A power of two (or 1): only the shift. */
+        for (uint32_t i = 0; i < count; i++) {
+            out[i] = (numbers[i] - base) >> divisor->shift;
+        }
+        return;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        out[i] = sx_divide_exact(numbers[i] - base, divisor);
+    }
+}
+
+static void width_counts_scalar(const uint64_t* numbers, uint32_t count, uint32_t max_width,
+                                uint32_t* counts) {
+    memset(counts, 0, ((size_t)max_width + 1u) * sizeof(uint32_t));
+    sx_add_width_counts(numbers, count, max_width, counts);
+}
+
+static uint32_t split_exceptions_scalar(const uint64_t* offsets, uint32_t count, uint64_t limit,
+                                        uint64_t* packed, uint16_t* positions,
+                                        uint64_t* exceptions) {
+    return sx_split_exceptions_from(offsets, 0, count, limit, packed, positions, exceptions, 0);
+}
+
+static void to_lane_order_scalar(const uint64_t* values, uint32_t count, uint64_t* out) {
+    uint32_t rows = sx_bitpack_rows(count);
+    memset(out, 0, (size_t)rows * SX_BITPACK_ROW_BYTES);
+    /* Lane l takes the run of values starting at l * rows. */
+    for (uint32_t lane = 0; lane < SX_BITPACK_LANES && lane * rows < count; lane++) {
+        const uint64_t* run = values + (size_t)lane * rows;
+        uint32_t run_length = count - lane * rows < rows ? count - lane * rows : rows;
+        for (uint32_t row = 0; row < run_length; row++) {
+            out[(size_t)row * SX_BITPACK_LANES + lane] = run[row];
+        }
+    }
+}
+
 const sx_codec_kernels sx_kernels_scalar = {
     .level = SX_SIMD_SCALAR,
     .bitpack = bitpack_scalar,
@@ -130,4 +196,10 @@ const sx_codec_kernels sx_kernels_scalar = {
     .decode_alp = decode_alp_scalar,
     .rebuild_deltas = rebuild_deltas_scalar,
     .encode_alp = encode_alp_scalar,
+    .summarize_ints = summarize_ints_scalar,
+    .first_non_multiple = first_non_multiple_scalar,
+    .divide_exact = divide_exact_scalar,
+    .width_counts = width_counts_scalar,
+    .split_exceptions = split_exceptions_scalar,
+    .to_lane_order = to_lane_order_scalar,
 };

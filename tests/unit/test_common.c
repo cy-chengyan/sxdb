@@ -97,6 +97,37 @@ static void test_bits_helpers(void) {
     SX_CHECK_EQ_U64(sx_zigzag_encode(1), 2);
 }
 
+/* Euclid's algorithm, the reference for the binary one. */
+static uint64_t euclid_gcd(uint64_t a, uint64_t b) {
+    while (b != 0) {
+        uint64_t remainder = a % b;
+        a = b;
+        b = remainder;
+    }
+    return a;
+}
+
+static void test_gcd_matches_euclid(void) {
+    static const uint64_t specials[] = {
+        0, 1, 2, 3, 64, 100, UINT64_C(60000000000), UINT64_C(1) << 63, UINT64_MAX, UINT64_MAX - 1,
+    };
+    for (size_t i = 0; i < SX_ARRAY_SIZE(specials); i++) {
+        for (size_t j = 0; j < SX_ARRAY_SIZE(specials); j++) {
+            SX_CHECK_EQ_U64(sx_gcd_u64(specials[i], specials[j]),
+                            euclid_gcd(specials[i], specials[j]));
+        }
+    }
+    sx_rng rng;
+    sx_rng_seed(&rng, 3);
+    for (uint32_t round = 0; round < 100000; round++) {
+        /* A shared factor, times random cofactors of random sizes. */
+        uint64_t factor = sx_rng_next(&rng) >> sx_rng_below(&rng, 64);
+        uint64_t a = factor * (sx_rng_next(&rng) >> sx_rng_below(&rng, 64));
+        uint64_t b = factor * (sx_rng_next(&rng) >> sx_rng_below(&rng, 64));
+        SX_CHECK_EQ_U64(sx_gcd_u64(a, b), euclid_gcd(a, b));
+    }
+}
+
 static void test_byte_writer_and_reader_bounds(void) {
     uint8_t buffer[12];
     sx_byte_writer writer;
@@ -191,6 +222,7 @@ static const sx_test_case cases[] = {
     {"varint_round_trip", test_varint_round_trip},
     {"varint_malformed", test_varint_rejects_malformed_input},
     {"bits_helpers", test_bits_helpers},
+    {"gcd_matches_euclid", test_gcd_matches_euclid},
     {"byte_writer_reader_bounds", test_byte_writer_and_reader_bounds},
     {"parse_size", test_parse_size},
     {"hash", test_hash_is_deterministic_and_seeded},

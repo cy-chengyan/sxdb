@@ -46,9 +46,9 @@ static bool cpu_supports(sx_simd_level level) {
         case SX_SIMD_SCALAR:
             return true;
         case SX_SIMD_AVX2:
-            return sx_os_cpu_has_avx2();
+            return sx_os_cpu_has_x86_64_v3();
         case SX_SIMD_AVX512:
-            return sx_os_cpu_has_avx512();
+            return sx_os_cpu_has_x86_64_v4();
         case SX_SIMD_NEON:
             /* NEON (Advanced SIMD) is a mandatory part of ARMv8-A. */
 #if defined(SX_ARCH_ARM64)

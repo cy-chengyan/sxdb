@@ -17,6 +17,7 @@
 #include "encoding/int_codec.h"
 #include "encoding/kernels.h"
 
+#include <inttypes.h>
 #include <math.h>
 #include <stdio.h>
 
@@ -314,6 +315,280 @@ static void test_encode_alp_matches_scalar(void) {
 }
 
 /* ---------------------------------------------------------------------------------------- */
+/* Integer encoding kernels                                                                 */
+/* ---------------------------------------------------------------------------------------- */
+
+#define SENTINEL UINT64_C(0xA5A5A5A5A5A5A5A5)
+
+/* Integers of one kind: a walk, long runs, extremes whose deltas wrap, regular steps with
+ * a few large gaps, or random bits. */
+static void fill_integers(sx_rng* rng, uint32_t kind, int64_t* values, uint32_t count) {
+    uint64_t value = sx_rng_next(rng);
+    for (uint32_t i = 0; i < count; i++) {
+        switch (kind % 5u) {
+            case 0:
+                value += sx_rng_below(rng, 7) - 3u;
+                break;
+            case 1:
+                if (sx_rng_below(rng, 50) == 0) {
+                    value = sx_rng_below(rng, 4);
+                }
+                break;
+            case 2:
+                value = sx_rng_below(rng, 2) == 0 ? (uint64_t)INT64_MIN + sx_rng_below(rng, 3)
+                                                  : (uint64_t)INT64_MAX - sx_rng_below(rng, 3);
+                break;
+            case 3:
+                value += sx_rng_below(rng, 64) == 0 ? sx_rng_next(rng) >> 8 : 60u;
+                break;
+            default:
+                value = sx_rng_next(rng);
+                break;
+        }
+        values[i] = (int64_t)value;
+    }
+}
+
+static void test_summarize_ints_matches_scalar(void) {
+    const sx_codec_kernels* scalar = level_kernels(SX_SIMD_SCALAR);
+    sx_simd_level levels[SX_SIMD_LEVEL_COUNT];
+    uint32_t level_count = simd_levels(levels);
+    sx_rng rng;
+    sx_rng_seed(&rng, 6);
+    int64_t values[SX_VECTOR_SIZE];
+    uint64_t expected_deltas[SX_VECTOR_SIZE];
+    uint64_t actual_deltas[SX_VECTOR_SIZE];
+    for (uint32_t kind = 0; kind < 10u; kind++) {
+        for (size_t c = 0; c < SX_ARRAY_SIZE(counts); c++) {
+            uint32_t count = counts[c];
+            fill_integers(&rng, kind, values, count);
+            sx_int_summary expected;
+            scalar->summarize_ints(values, count, expected_deltas, &expected);
+            for (uint32_t l = 0; l < level_count; l++) {
+                const char* name = sx_simd_level_name(levels[l]);
+                sx_int_summary actual;
+                memset(actual_deltas, 0xA5, sizeof(actual_deltas));
+                level_kernels(levels[l])->summarize_ints(values, count, actual_deltas, &actual);
+                SX_CHECK_EQ_I64(actual.min, expected.min);
+                SX_CHECK_EQ_I64(actual.max, expected.max);
+                SX_CHECK_EQ_I64(actual.delta_min, expected.delta_min);
+                SX_CHECK_EQ_I64(actual.delta_max, expected.delta_max);
+                SX_CHECK_EQ_U64(actual.changes, expected.changes);
+                SX_CHECK_EQ_MEM(actual_deltas, expected_deltas, (count - 1u) * sizeof(uint64_t));
+                for (uint32_t i = count - 1u; i < SX_VECTOR_SIZE; i++) {
+                    if (actual_deltas[i] != SENTINEL) {
+                        sx_test_fail(__FILE__, __LINE__, "%s summarize_ints wrote delta %u of %u",
+                                     name, i, count - 1u);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/* A divisor for the multiple tests: each special case of the test, or random. */
+static uint64_t pick_divisor(sx_rng* rng, uint32_t round) {
+    static const uint64_t divisors[] = {
+        0, 1, 2, 3, 8, 100, 60000000000u, UINT64_C(1) << 63, UINT64_MAX,
+    };
+    if (round % 4u == 3u) {
+        return sx_rng_next(rng) >> sx_rng_below(rng, 64);
+    }
+    return divisors[sx_rng_below(rng, SX_ARRAY_SIZE(divisors))];
+}
+
+/* base + k * divisor (wrapping) with small or large k, so that most numbers minus the base
+ * are multiples; then a few numbers are moved off by 1 to divisor - 1. */
+static void fill_multiples(sx_rng* rng, uint64_t base, uint64_t divisor, uint64_t* numbers,
+                           uint32_t count) {
+    for (uint32_t i = 0; i < count; i++) {
+        uint64_t k = sx_rng_below(rng, 2) == 0 ? sx_rng_below(rng, 1000) : sx_rng_next(rng);
+        numbers[i] = base + k * divisor;
+    }
+    uint32_t misses = (uint32_t)sx_rng_below(rng, 3);
+    for (uint32_t m = 0; m < misses && divisor != 1; m++) {
+        uint64_t off = divisor == 0 ? sx_rng_next(rng) | 1u : 1u + sx_rng_below(rng, divisor - 1u);
+        numbers[sx_rng_below(rng, count)] += off;
+    }
+}
+
+static void test_first_non_multiple_matches_scalar(void) {
+    const sx_codec_kernels* scalar = level_kernels(SX_SIMD_SCALAR);
+    sx_simd_level levels[SX_SIMD_LEVEL_COUNT];
+    uint32_t level_count = simd_levels(levels);
+    sx_rng rng;
+    sx_rng_seed(&rng, 7);
+    uint64_t numbers[SX_VECTOR_SIZE];
+    uint64_t expected_quotients[SX_VECTOR_SIZE];
+    uint64_t actual_quotients[SX_VECTOR_SIZE];
+    for (uint32_t round = 0; round < 2000; round++) {
+        uint32_t count = counts[round % SX_ARRAY_SIZE(counts)];
+        uint64_t divisor = pick_divisor(&rng, round);
+        uint64_t base = round % 3u == 0 ? 0 : sx_rng_next(&rng);
+        fill_multiples(&rng, base, divisor, numbers, count);
+        sx_multiple_test test = sx_multiple_test_make(divisor);
+        uint32_t starts[] = {0, (uint32_t)sx_rng_below(&rng, count), count};
+        for (size_t s = 0; s < SX_ARRAY_SIZE(starts); s++) {
+            uint32_t start = starts[s];
+            uint32_t expected =
+                scalar->first_non_multiple(numbers, start, count, base, &test, expected_quotients);
+            for (uint32_t i = start; i < expected; i++) {
+                SX_CHECK_EQ_U64(expected_quotients[i] * divisor, numbers[i] - base);
+            }
+            for (uint32_t l = 0; l < level_count; l++) {
+                const char* name = sx_simd_level_name(levels[l]);
+                uint32_t actual = level_kernels(levels[l])->first_non_multiple(
+                    numbers, start, count, base, &test, actual_quotients);
+                if (actual != expected) {
+                    sx_test_fail(__FILE__, __LINE__,
+                                 "%s first_non_multiple: %u, expected %u (divisor %" PRIu64
+                                 ", count %u, start %u)",
+                                 name, actual, expected, divisor, count, start);
+                    return;
+                }
+                SX_CHECK_EQ_MEM(actual_quotients + start, expected_quotients + start,
+                                (expected - start) * sizeof(uint64_t));
+            }
+        }
+    }
+}
+
+static void test_divide_exact_matches_scalar(void) {
+    const sx_codec_kernels* scalar = level_kernels(SX_SIMD_SCALAR);
+    sx_simd_level levels[SX_SIMD_LEVEL_COUNT];
+    uint32_t level_count = simd_levels(levels);
+    sx_rng rng;
+    sx_rng_seed(&rng, 8);
+    uint64_t numbers[SX_VECTOR_SIZE];
+    uint64_t expected[SX_VECTOR_SIZE];
+    uint64_t actual[SX_VECTOR_SIZE];
+    for (uint32_t round = 0; round < 1000; round++) {
+        uint32_t count = counts[round % SX_ARRAY_SIZE(counts)];
+        uint64_t divisor = pick_divisor(&rng, round);
+        uint64_t base = round % 3u == 0 ? 0 : sx_rng_next(&rng);
+        fill_multiples(&rng, base, divisor, numbers, count);
+        sx_exact_divisor exact = sx_exact_divisor_make(divisor);
+        scalar->divide_exact(numbers, count, base, &exact, expected);
+        for (uint32_t l = 0; l < level_count; l++) {
+            const sx_codec_kernels* kernels = level_kernels(levels[l]);
+            memset(actual, 0xA5, sizeof(actual));
+            kernels->divide_exact(numbers, count, base, &exact, actual);
+            SX_CHECK_EQ_MEM(actual, expected, count * sizeof(uint64_t));
+            for (uint32_t i = count; i < SX_VECTOR_SIZE; i++) {
+                SX_CHECK_EQ_U64(actual[i], SENTINEL);
+            }
+            /* In place. */
+            memcpy(actual, numbers, count * sizeof(uint64_t));
+            kernels->divide_exact(actual, count, base, &exact, actual);
+            SX_CHECK_EQ_MEM(actual, expected, count * sizeof(uint64_t));
+        }
+    }
+}
+
+static void test_width_counts_match_scalar(void) {
+    const sx_codec_kernels* scalar = level_kernels(SX_SIMD_SCALAR);
+    sx_simd_level levels[SX_SIMD_LEVEL_COUNT];
+    uint32_t level_count = simd_levels(levels);
+    sx_rng rng;
+    sx_rng_seed(&rng, 9);
+    uint64_t numbers[SX_VECTOR_SIZE];
+    uint32_t expected[65];
+    uint32_t actual[65];
+    for (uint32_t max_width = 0; max_width <= 64; max_width++) {
+        for (size_t c = 0; c < SX_ARRAY_SIZE(counts); c++) {
+            uint32_t count = counts[c];
+            /* A few common widths, sometimes up to the maximum. */
+            uint32_t common = (uint32_t)sx_rng_below(&rng, max_width + 1u);
+            for (uint32_t i = 0; i < count; i++) {
+                uint32_t width = sx_rng_below(&rng, 4) == 0
+                                     ? (uint32_t)sx_rng_below(&rng, max_width + 1u)
+                                     : common;
+                numbers[i] =
+                    width == 0 ? 0 : (sx_rng_next(&rng) | UINT64_C(1) << 63) >> (64u - width);
+            }
+            scalar->width_counts(numbers, count, max_width, expected);
+            for (uint32_t l = 0; l < level_count; l++) {
+                memset(actual, 0xA5, sizeof(actual));
+                level_kernels(levels[l])->width_counts(numbers, count, max_width, actual);
+                if (memcmp(actual, expected, (max_width + 1u) * sizeof(uint32_t)) != 0) {
+                    sx_test_fail(__FILE__, __LINE__, "%s width_counts differ: max %u count %u",
+                                 sx_simd_level_name(levels[l]), max_width, count);
+                    return;
+                }
+                for (uint32_t w = max_width + 1u; w <= 64; w++) {
+                    SX_CHECK_EQ_U64(actual[w], UINT32_C(0xA5A5A5A5));
+                }
+            }
+        }
+    }
+}
+
+static void test_split_exceptions_matches_scalar(void) {
+    const sx_codec_kernels* scalar = level_kernels(SX_SIMD_SCALAR);
+    sx_simd_level levels[SX_SIMD_LEVEL_COUNT];
+    uint32_t level_count = simd_levels(levels);
+    sx_rng rng;
+    sx_rng_seed(&rng, 10);
+    uint64_t offsets[SX_VECTOR_SIZE];
+    uint64_t expected_packed[SX_VECTOR_SIZE];
+    uint64_t actual_packed[SX_VECTOR_SIZE];
+    uint16_t expected_positions[SX_VECTOR_SIZE];
+    uint16_t actual_positions[SX_VECTOR_SIZE];
+    uint64_t expected_exceptions[SX_VECTOR_SIZE];
+    uint64_t actual_exceptions[SX_VECTOR_SIZE];
+    for (uint32_t width = 0; width < 64; width++) {
+        for (size_t c = 0; c < SX_ARRAY_SIZE(counts); c++) {
+            uint32_t count = counts[c];
+            uint64_t limit = sx_low_mask_u64(width);
+            /* Offsets within the limit, with exceptions from rare to frequent. */
+            uint64_t rarity = 1u + sx_rng_below(&rng, 100);
+            for (uint32_t i = 0; i < count; i++) {
+                offsets[i] =
+                    sx_rng_below(&rng, rarity) == 0 ? sx_rng_next(&rng) : sx_rng_next(&rng) & limit;
+            }
+            uint32_t expected = scalar->split_exceptions(offsets, count, limit, expected_packed,
+                                                         expected_positions, expected_exceptions);
+            for (uint32_t l = 0; l < level_count; l++) {
+                memset(actual_packed, 0xA5, sizeof(actual_packed));
+                uint32_t actual = level_kernels(levels[l])->split_exceptions(
+                    offsets, count, limit, actual_packed, actual_positions, actual_exceptions);
+                SX_CHECK_EQ_U64(actual, expected);
+                SX_CHECK_EQ_MEM(actual_packed, expected_packed, count * sizeof(uint64_t));
+                SX_CHECK_EQ_MEM(actual_positions, expected_positions, expected * sizeof(uint16_t));
+                SX_CHECK_EQ_MEM(actual_exceptions, expected_exceptions,
+                                expected * sizeof(uint64_t));
+            }
+        }
+    }
+}
+
+static void test_to_lane_order_matches_scalar(void) {
+    const sx_codec_kernels* scalar = level_kernels(SX_SIMD_SCALAR);
+    sx_simd_level levels[SX_SIMD_LEVEL_COUNT];
+    uint32_t level_count = simd_levels(levels);
+    sx_rng rng;
+    sx_rng_seed(&rng, 11);
+    uint64_t values[SX_VECTOR_SIZE];
+    uint64_t expected[SX_VECTOR_SIZE];
+    uint64_t actual[SX_VECTOR_SIZE];
+    for (uint32_t count = 1; count <= SX_VECTOR_SIZE; count++) {
+        fill_random(&rng, values, count * sizeof(uint64_t));
+        size_t size = sx_bitpack_padded_count(count) * sizeof(uint64_t);
+        scalar->to_lane_order(values, count, expected);
+        for (uint32_t l = 0; l < level_count; l++) {
+            fill_random(&rng, actual, sizeof(actual));
+            level_kernels(levels[l])->to_lane_order(values, count, actual);
+            if (memcmp(actual, expected, size) != 0) {
+                sx_test_fail(__FILE__, __LINE__, "%s to_lane_order differs: count %u",
+                             sx_simd_level_name(levels[l]), count);
+                return;
+            }
+        }
+    }
+}
+
+/* ---------------------------------------------------------------------------------------- */
 /* Whole decoders on random and corrupted payloads                                          */
 /* ---------------------------------------------------------------------------------------- */
 
@@ -436,6 +711,12 @@ static const sx_test_case cases[] = {
     {"decode_alp_matches_scalar", test_decode_alp_matches_scalar},
     {"rebuild_deltas_matches_scalar", test_rebuild_deltas_matches_scalar},
     {"encode_alp_matches_scalar", test_encode_alp_matches_scalar},
+    {"summarize_ints_matches_scalar", test_summarize_ints_matches_scalar},
+    {"first_non_multiple_matches_scalar", test_first_non_multiple_matches_scalar},
+    {"divide_exact_matches_scalar", test_divide_exact_matches_scalar},
+    {"width_counts_match_scalar", test_width_counts_match_scalar},
+    {"split_exceptions_matches_scalar", test_split_exceptions_matches_scalar},
+    {"to_lane_order_matches_scalar", test_to_lane_order_matches_scalar},
     {"decoders_agree_on_random_payloads", test_decoders_agree_on_random_payloads},
     {"decoders_agree_on_corrupted_chunks", test_decoders_agree_on_corrupted_chunks},
 };

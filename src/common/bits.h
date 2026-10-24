@@ -43,7 +43,12 @@ static inline uint64_t sx_low_mask_u64(uint32_t width) {
     return (UINT64_C(1) << width) - 1u;
 }
 
-/* Greatest common divisor (binary algorithm). gcd(0, b) is b. */
+/*
+ * Greatest common divisor (binary algorithm). gcd(0, b) is b. With both numbers odd, each
+ * step replaces the larger one by their difference without its factors of two. The
+ * trailing zeros are counted on b - a, which has as many as |a - b|, so the count does
+ * not wait for the comparison that picks the larger number.
+ */
 static inline uint64_t sx_gcd_u64(uint64_t a, uint64_t b) {
     if (a == 0) {
         return b;
@@ -51,16 +56,18 @@ static inline uint64_t sx_gcd_u64(uint64_t a, uint64_t b) {
     if (b == 0) {
         return a;
     }
+    if (a == 1 || b == 1) {
+        return 1; /* common in codecs, and slow for the loop below */
+    }
     uint32_t shift = sx_trailing_zeros_u64(a | b);
     a >>= sx_trailing_zeros_u64(a);
-    while (b != 0) {
-        b >>= sx_trailing_zeros_u64(b);
-        if (a > b) {
-            uint64_t tmp = a;
-            a = b;
-            b = tmp;
-        }
-        b -= a;
+    b >>= sx_trailing_zeros_u64(b);
+    while (a != b) {
+        uint32_t zeros = sx_trailing_zeros_u64(b - a);
+        uint64_t smaller = a < b ? a : b;
+        uint64_t difference = a < b ? b - a : a - b;
+        a = smaller;
+        b = difference >> zeros;
     }
     return a << shift;
 }

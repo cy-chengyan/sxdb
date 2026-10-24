@@ -1,18 +1,22 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 /*
- * AVX2 codec kernels (x86_64). This file is compiled with -mavx2 and is only called after
- * the CPU check in kernels.c. A row of 16 values is four 256-bit vectors of four lanes.
- * Every function computes exactly what its portable counterpart in kernels_scalar.c
- * computes; see kernels.h for the contracts.
+ * AVX2 codec kernels (x86_64, the integer part of the x86-64-v3 level: AVX2, BMI1, BMI2,
+ * LZCNT, and POPCNT). This file is compiled for those instruction sets only (see
+ * src/CMakeLists.txt) and is only called after the CPU check in kernels.c. A row of 16
+ * values is four 256-bit vectors of four lanes. Every function computes exactly what its
+ * portable counterpart in kernels_scalar.c computes; see kernels.h for the contracts.
  */
 
 #include "encoding/bitpack.h"
 #include "encoding/kernels.h"
 #include "encoding/kernels_alp.h"
+#include "encoding/kernels_int.h"
 
 #include "common/bits.h"
 #include "common/compiler.h"
+
+#include <string.h>
 
 #if defined(SX_ARCH_X86_64)
 
@@ -399,6 +403,268 @@ static uint32_t encode_alp_avx2(const double* values, uint32_t count, const sx_a
     return exceptions;
 }
 
+/* The running minimums and maximums of summarize_ints, for one vector of four lanes. */
+typedef struct int_ranges {
+    __m256i min;
+    __m256i max;
+    __m256i delta_min;
+    __m256i delta_max;
+} int_ranges;
+
+/* Adds the four values at values + i, and their deltas, to the ranges; returns how many
+ * deltas are zero. */
+static inline uint32_t add_to_ranges(const int64_t* values, uint32_t i, uint64_t* deltas,
+                                     int_ranges* r) {
+    __m256i v = load(values + i);
+    __m256i previous = load(values + i - 1);
+    __m256i delta = _mm256_sub_epi64(v, previous);
+    store(deltas + i - 1, delta);
+    r->min = min_i64x4(r->min, v);
+    r->max = max_i64x4(r->max, v);
+    r->delta_min = min_i64x4(r->delta_min, delta);
+    r->delta_max = max_i64x4(r->delta_max, delta);
+    __m256i same = _mm256_cmpeq_epi64(v, previous);
+    return sx_popcount_u64((uint32_t)_mm256_movemask_pd(_mm256_castsi256_pd(same)));
+}
+
+/*
+ * Each vector of values is subtracted from the same values loaded one element earlier,
+ * which gives four deltas. Two sets of ranges take turns, since each compare-and-select
+ * waits for the previous one; the last values are summarized one by one.
+ */
+static void summarize_ints_avx2(const int64_t* values, uint32_t count, uint64_t* deltas,
+                                sx_int_summary* summary) {
+    sx_summary_start(values, count, summary);
+    int_ranges even = {
+        .min = _mm256_set1_epi64x(summary->min),
+        .max = _mm256_set1_epi64x(summary->max),
+        .delta_min = _mm256_set1_epi64x(summary->delta_min),
+        .delta_max = _mm256_set1_epi64x(summary->delta_max),
+    };
+    int_ranges odd = even;
+    uint32_t equal = 0;
+    uint32_t i = 1;
+    for (; i + 2u * VECTOR_LANES <= count; i += 2u * VECTOR_LANES) {
+        equal += add_to_ranges(values, i, deltas, &even);
+        equal += add_to_ranges(values, i + VECTOR_LANES, deltas, &odd);
+    }
+    if (i + VECTOR_LANES <= count) {
+        equal += add_to_ranges(values, i, deltas, &even);
+        i += VECTOR_LANES;
+    }
+    int64_t lanes[4][VECTOR_LANES];
+    store(lanes[0], min_i64x4(even.min, odd.min));
+    store(lanes[1], max_i64x4(even.max, odd.max));
+    store(lanes[2], min_i64x4(even.delta_min, odd.delta_min));
+    store(lanes[3], max_i64x4(even.delta_max, odd.delta_max));
+    for (uint32_t lane = 0; lane < VECTOR_LANES; lane++) {
+        summary->min = sx_min_i64(summary->min, lanes[0][lane]);
+        summary->max = sx_max_i64(summary->max, lanes[1][lane]);
+        summary->delta_min = sx_min_i64(summary->delta_min, lanes[2][lane]);
+        summary->delta_max = sx_max_i64(summary->delta_max, lanes[3][lane]);
+    }
+    summary->changes = (i - 1u) - equal;
+    sx_summarize_ints_from(values, i, count, deltas, summary);
+}
+
+/* The constants of a multiple test, in vectors. Unsigned comparisons flip the sign bits. */
+typedef struct multiple_vectors {
+    __m256i base;
+    __m256i shift;
+    __m256i inverse;
+    __m256i inverse_high;
+    __m256i low_bits;
+    __m256i sign;
+    __m256i max_quotient; /* sign flipped */
+    bool multiply;        /* false if the odd part of the divisor is 1: only low bits matter */
+} multiple_vectors;
+
+/*
+ * True if a number of the eight at `numbers`, minus the base, is not a multiple; writes
+ * the quotients of all eight.
+ */
+static inline bool any_misses(const uint64_t* numbers, const multiple_vectors* t,
+                              uint64_t* quotients) {
+    __m256i x[2] = {
+        _mm256_sub_epi64(load(numbers), t->base),
+        _mm256_sub_epi64(load(numbers + VECTOR_LANES), t->base),
+    };
+    __m256i quotient[2] = {
+        _mm256_srlv_epi64(x[0], t->shift),
+        _mm256_srlv_epi64(x[1], t->shift),
+    };
+    __m256i misses =
+        _mm256_or_si256(_mm256_and_si256(x[0], t->low_bits), _mm256_and_si256(x[1], t->low_bits));
+    /* Zero is a multiple of every divisor; blocks of zeros skip the multiplications. */
+    __m256i any = _mm256_or_si256(x[0], x[1]);
+    if (t->multiply && !_mm256_testz_si256(any, any)) {
+        for (uint32_t k = 0; k < 2u; k++) {
+            quotient[k] = multiply_u64(quotient[k], t->inverse, t->inverse_high);
+            __m256i flipped = _mm256_xor_si256(quotient[k], t->sign);
+            misses = _mm256_or_si256(misses, _mm256_cmpgt_epi64(flipped, t->max_quotient));
+        }
+    }
+    store(quotients, quotient[0]);
+    store(quotients + VECTOR_LANES, quotient[1]);
+    return !_mm256_testz_si256(misses, misses);
+}
+
+/* Blocks of eight numbers are tested with one branch; the rest one by one. */
+static uint32_t first_non_multiple_avx2(const uint64_t* numbers, uint32_t start, uint32_t count,
+                                        uint64_t base, const sx_multiple_test* test,
+                                        uint64_t* quotients) {
+    multiple_vectors t = {
+        .base = _mm256_set1_epi64x((long long)base),
+        .shift = _mm256_set1_epi64x(test->exact.shift),
+        .inverse = _mm256_set1_epi64x((long long)test->exact.inverse),
+        .inverse_high = _mm256_set1_epi64x((long long)(test->exact.inverse >> 32)),
+        .low_bits = _mm256_set1_epi64x((long long)test->low_bits),
+        .sign = _mm256_set1_epi64x(INT64_MIN),
+        .max_quotient = _mm256_set1_epi64x((long long)(test->max_quotient ^ (uint64_t)INT64_MIN)),
+        .multiply = test->max_quotient != UINT64_MAX,
+    };
+    uint32_t i = start;
+    for (; i + 2u * VECTOR_LANES <= count; i += 2u * VECTOR_LANES) {
+        if (any_misses(numbers + i, &t, quotients + i)) {
+            break;
+        }
+    }
+    return sx_first_non_multiple_from(numbers, i, count, base, test, quotients);
+}
+
+static void divide_exact_avx2(const uint64_t* numbers, uint32_t count, uint64_t base,
+                              const sx_exact_divisor* divisor, uint64_t* out) {
+    __m256i base_vector = _mm256_set1_epi64x((long long)base);
+    __m256i shift = _mm256_set1_epi64x(divisor->shift);
+    __m256i inverse = _mm256_set1_epi64x((long long)divisor->inverse);
+    __m256i inverse_high = _mm256_set1_epi64x((long long)(divisor->inverse >> 32));
+    bool multiply = divisor->inverse != 1;
+    uint32_t i = 0;
+    for (; i + VECTOR_LANES <= count; i += VECTOR_LANES) {
+        __m256i quotient =
+            _mm256_srlv_epi64(_mm256_sub_epi64(load(numbers + i), base_vector), shift);
+        if (multiply) {
+            quotient = multiply_u64(quotient, inverse, inverse_high);
+        }
+        store(out + i, quotient);
+    }
+    for (; i < count; i++) {
+        out[i] = sx_divide_exact(numbers[i] - base, divisor);
+    }
+}
+
+/*
+ * The widths of 32 numbers below 2^52, merged into the 32 bytes of one vector: one byte
+ * per number, in some order. AVX2 has no leading zero count of 64-bit lanes, but such
+ * numbers convert to doubles exactly: placed in the mantissa of 2^52, minus 2^52. The
+ * exponent field of the result is 1022 + width for a non-zero number and 0 for zero.
+ */
+static inline __m256i merged_widths(const uint64_t* numbers) {
+    __m256i magic_bits = _mm256_set1_epi64x(0x4330000000000000);
+    __m256d magic = _mm256_set1_pd(4503599627370496.0); /* 2^52 */
+    __m256i exponent_bias = _mm256_set1_epi64x(1022);
+    __m256i zero = _mm256_setzero_si256();
+    __m256i widths = zero;
+    for (uint32_t k = 0; k < 8u; k++) {
+        __m256i x = load(numbers + k * VECTOR_LANES);
+        __m256d exact = _mm256_sub_pd(_mm256_castsi256_pd(_mm256_or_si256(x, magic_bits)), magic);
+        __m256i exponent = _mm256_srli_epi64(_mm256_castpd_si256(exact), 52);
+        /* Zero gives -1022; a 32-bit maximum with 0 clears both halves of it. */
+        __m256i width = _mm256_max_epi32(_mm256_sub_epi64(exponent, exponent_bias), zero);
+        widths = _mm256_or_si256(widths, _mm256_sllv_epi64(width, _mm256_set1_epi64x(8 * k)));
+    }
+    return widths;
+}
+
+/*
+ * Blocks of 32 numbers are merged (merged_widths), and then the bytes of all blocks are
+ * counted for each width. Wider numbers and the last few numbers are counted one by one.
+ */
+static void width_counts_avx2(const uint64_t* numbers, uint32_t count, uint32_t max_width,
+                              uint32_t* counts) {
+    memset(counts, 0, ((size_t)max_width + 1u) * sizeof(uint32_t));
+    uint32_t block_count = 0;
+    if (max_width <= 52u) {
+        __m256i blocks[SX_VECTOR_SIZE / 32u];
+        for (; (block_count + 1u) * 32u <= count; block_count++) {
+            blocks[block_count] = merged_widths(numbers + block_count * 32u);
+        }
+        __m256i target = _mm256_setzero_si256();
+        __m256i one = _mm256_set1_epi8(1);
+        for (uint32_t width = 0; width <= max_width; width++) {
+            uint32_t total = 0;
+            for (uint32_t b = 0; b < block_count; b++) {
+                __m256i same = _mm256_cmpeq_epi8(blocks[b], target);
+                total += sx_popcount_u64((uint32_t)_mm256_movemask_epi8(same));
+            }
+            counts[width] = total;
+            target = _mm256_add_epi8(target, one);
+        }
+    }
+    uint32_t counted = block_count * 32u;
+    sx_add_width_counts(numbers + counted, count - counted, max_width, counts);
+}
+
+static uint32_t split_exceptions_avx2(const uint64_t* offsets, uint32_t count, uint64_t limit,
+                                      uint64_t* packed, uint16_t* positions, uint64_t* exceptions) {
+    __m256i sign = _mm256_set1_epi64x(INT64_MIN);
+    __m256i limit_vector = _mm256_set1_epi64x((long long)(limit ^ (uint64_t)INT64_MIN));
+    uint32_t exception_count = 0;
+    uint32_t i = 0;
+    for (; i + VECTOR_LANES <= count; i += VECTOR_LANES) {
+        __m256i x = load(offsets + i);
+        __m256i wide = _mm256_cmpgt_epi64(_mm256_xor_si256(x, sign), limit_vector);
+        store(packed + i, _mm256_andnot_si256(wide, x));
+        uint32_t bits = (uint32_t)_mm256_movemask_pd(_mm256_castsi256_pd(wide));
+        for (; bits != 0; bits &= bits - 1u) {
+            uint32_t index = i + sx_trailing_zeros_u64(bits);
+            positions[exception_count] = (uint16_t)index;
+            exceptions[exception_count] = offsets[index];
+            exception_count++;
+        }
+    }
+    return sx_split_exceptions_from(offsets, i, count, limit, packed, positions, exceptions,
+                                    exception_count);
+}
+
+/*
+ * Each 4x4 block of the output (four rows of four lanes) comes from four runs of four
+ * values, one per lane, and is transposed from them. Blocks of full lanes are loaded
+ * directly; at the end of the lanes, missing values are loaded as zeros.
+ */
+static void to_lane_order_avx2(const uint64_t* values, uint32_t count, uint64_t* out) {
+    uint32_t rows = sx_bitpack_rows(count);
+    __m256i lane_index = _mm256_setr_epi64x(0, 1, 2, 3);
+    for (uint32_t first_lane = 0; first_lane < SX_BITPACK_LANES; first_lane += VECTOR_LANES) {
+        for (uint32_t row = 0; row < rows; row += 4u) {
+            bool full =
+                row + 4u <= rows && (first_lane + VECTOR_LANES - 1u) * rows + row + 4u <= count;
+            __m256i block[4];
+            for (uint32_t j = 0; j < 4u; j++) {
+                /* Values of lane first_lane + j in rows [row, row + 4). */
+                uint32_t start = (first_lane + j) * rows + row;
+                if (full) {
+                    block[j] = load(values + start);
+                    continue;
+                }
+                uint32_t in_lane = rows - row < 4u ? rows - row : 4u;
+                uint32_t available = start < count ? count - start : 0;
+                uint32_t present = available < in_lane ? available : in_lane;
+                if (present == 0) {
+                    block[j] = _mm256_setzero_si256();
+                } else {
+                    __m256i mask = _mm256_cmpgt_epi64(_mm256_set1_epi64x(present), lane_index);
+                    block[j] = _mm256_maskload_epi64((const long long*)(values + start), mask);
+                }
+            }
+            transpose_4x4(block);
+            for (uint32_t j = 0; j < 4u && row + j < rows; j++) {
+                store(out + (size_t)(row + j) * SX_BITPACK_LANES + first_lane, block[j]);
+            }
+        }
+    }
+}
+
 const sx_codec_kernels sx_kernels_avx2 = {
     .level = SX_SIMD_AVX2,
     .bitpack = bitpack_avx2,
@@ -407,6 +673,12 @@ const sx_codec_kernels sx_kernels_avx2 = {
     .decode_alp = decode_alp_avx2,
     .rebuild_deltas = rebuild_deltas_avx2,
     .encode_alp = encode_alp_avx2,
+    .summarize_ints = summarize_ints_avx2,
+    .first_non_multiple = first_non_multiple_avx2,
+    .divide_exact = divide_exact_avx2,
+    .width_counts = width_counts_avx2,
+    .split_exceptions = split_exceptions_avx2,
+    .to_lane_order = to_lane_order_avx2,
 };
 
 #endif /* SX_ARCH_X86_64 */

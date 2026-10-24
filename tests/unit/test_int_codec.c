@@ -2,6 +2,7 @@
 
 #include "sx_test.h"
 
+#include "common/bits.h"
 #include "common/compiler.h"
 #include "common/rng.h"
 #include "encoding/int_codec.h"
@@ -372,6 +373,83 @@ static void test_delta_encodings_every_count(void) {
     }
 }
 
+/* Euclid's algorithm, independent of the binary one in common/bits.h. */
+static uint64_t euclid_gcd(uint64_t a, uint64_t b) {
+    while (b != 0) {
+        uint64_t remainder = a % b;
+        a = b;
+        b = remainder;
+    }
+    return a;
+}
+
+/*
+ * The FOR multiplier is the gcd of the offsets from the minimum. The encoder derives it
+ * from the deltas when the value range is below 2^63 and scans the offsets otherwise;
+ * both must agree with a plain computation, including for descending values and for
+ * ranges whose deltas wrap around.
+ */
+static void test_for_multiplier_is_gcd_of_offsets(void) {
+    int64_t values[SX_VECTOR_SIZE];
+    sx_rng rng;
+    sx_rng_seed(&rng, 12);
+    for (uint32_t round = 0; round < 3000; round++) {
+        uint32_t count = 1u + (uint32_t)sx_rng_below(&rng, SX_VECTOR_SIZE);
+        uint64_t step = sx_rng_next(&rng) >> sx_rng_below(&rng, 64);
+        uint64_t base = sx_rng_next(&rng);
+        uint64_t spread = round % 3u == 0 ? sx_rng_next(&rng) : 1u + sx_rng_below(&rng, 1000);
+        for (uint32_t i = 0; i < count; i++) {
+            values[i] = (int64_t)(base + sx_rng_below(&rng, spread) * step);
+        }
+        int64_t min = values[0];
+        for (uint32_t i = 1; i < count; i++) {
+            min = values[i] < min ? values[i] : min;
+        }
+        uint64_t expected = 0;
+        for (uint32_t i = 0; i < count; i++) {
+            expected = euclid_gcd(expected, (uint64_t)values[i] - (uint64_t)min);
+        }
+
+        uint8_t buffer[SX_VECTOR_SIZE * 16];
+        sx_byte_writer writer;
+        sx_writer_init(&writer, buffer, sizeof(buffer));
+        SX_CHECK(sx_int64_encode_as(SX_ENCODING_FOR_BITPACK, values, count, &writer) == SX_OK);
+        SX_CHECK_EQ_U64(sx_load_u64(buffer + 8), expected);
+    }
+}
+
+/*
+ * sx_int64_encode skips the frames of reference when CONSTANT or DELTA_CONST applies;
+ * whatever it chooses must be byte for byte what sx_int64_encode_as produces with all
+ * statistics.
+ */
+static void test_choice_matches_forced_encoding(void) {
+    int64_t values[SX_VECTOR_SIZE];
+    sx_rng rng;
+    sx_rng_seed(&rng, 13);
+    for (uint32_t round = 0; round < 2000; round++) {
+        uint32_t count = 1u + (uint32_t)sx_rng_below(&rng, SX_VECTOR_SIZE);
+        uint64_t value = sx_rng_next(&rng);
+        uint64_t step =
+            sx_rng_below(&rng, 4) == 0 ? 0 : sx_rng_next(&rng) >> sx_rng_below(&rng, 64);
+        for (uint32_t i = 0; i < count; i++) {
+            values[i] = (int64_t)value;
+            value += step;
+            if (round % 2u == 1u && sx_rng_below(&rng, 200) == 0) {
+                value += sx_rng_below(&rng, 1000); /* an irregular step */
+            }
+        }
+        encoded_chunk chosen;
+        SX_CHECK(round_trip(values, count, &chosen));
+        uint8_t forced[SX_VECTOR_SIZE * sizeof(int64_t)];
+        sx_byte_writer writer;
+        sx_writer_init(&writer, forced, sizeof(forced));
+        SX_CHECK(sx_int64_encode_as(chosen.encoding, values, count, &writer) == SX_OK);
+        SX_CHECK_EQ_U64(writer.size, chosen.size);
+        SX_CHECK_EQ_MEM(forced, chosen.data, chosen.size);
+    }
+}
+
 static const sx_test_case cases[] = {
     {"constant", test_constant},
     {"regular_timestamps", test_regular_timestamps_use_delta_const},
@@ -388,6 +466,8 @@ static const sx_test_case cases[] = {
     {"patched_corruption", test_patched_corruption_is_rejected},
     {"random_payloads", test_random_payloads_never_crash},
     {"delta_encodings_every_count", test_delta_encodings_every_count},
+    {"for_multiplier_is_gcd", test_for_multiplier_is_gcd_of_offsets},
+    {"choice_matches_forced", test_choice_matches_forced_encoding},
 };
 
 const sx_test_suite sx_test_suite_int_codec = SX_TEST_SUITE("int_codec", cases);

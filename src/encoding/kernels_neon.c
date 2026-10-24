@@ -9,9 +9,12 @@
 #include "encoding/bitpack.h"
 #include "encoding/kernels.h"
 #include "encoding/kernels_alp.h"
+#include "encoding/kernels_int.h"
 
 #include "common/bits.h"
 #include "common/compiler.h"
+
+#include <string.h>
 
 #if defined(SX_ARCH_ARM64)
 
@@ -377,6 +380,191 @@ static uint32_t encode_alp_neon(const double* values, uint32_t count, const sx_a
     return exceptions;
 }
 
+/*
+ * Each vector of values is subtracted from the same values loaded one element earlier,
+ * which gives two deltas; the last value, if any, is summarized alone.
+ */
+static void summarize_ints_neon(const int64_t* values, uint32_t count, uint64_t* deltas,
+                                sx_int_summary* summary) {
+    sx_summary_start(values, count, summary);
+    int64x2_t min = vdupq_n_s64(summary->min);
+    int64x2_t max = min;
+    int64x2_t delta_min = vdupq_n_s64(summary->delta_min);
+    int64x2_t delta_max = delta_min;
+    uint64x2_t equal = vdupq_n_u64(0);
+    uint32_t i = 1;
+    for (; i + VECTOR_LANES <= count; i += VECTOR_LANES) {
+        int64x2_t v = vld1q_s64(values + i);
+        int64x2_t previous = vld1q_s64(values + i - 1);
+        int64x2_t delta = vsubq_s64(v, previous);
+        vst1q_u64(deltas + i - 1, vreinterpretq_u64_s64(delta));
+        min = min_i64x2(min, v);
+        max = max_i64x2(max, v);
+        delta_min = min_i64x2(delta_min, delta);
+        delta_max = max_i64x2(delta_max, delta);
+        /* An equal lane is all ones, minus one. */
+        equal = vsubq_u64(equal, vceqq_s64(v, previous));
+    }
+    summary->min = min_i64(summary->min, min_i64(vgetq_lane_s64(min, 0), vgetq_lane_s64(min, 1)));
+    summary->max = max_i64(summary->max, max_i64(vgetq_lane_s64(max, 0), vgetq_lane_s64(max, 1)));
+    summary->delta_min = min_i64(
+        summary->delta_min, min_i64(vgetq_lane_s64(delta_min, 0), vgetq_lane_s64(delta_min, 1)));
+    summary->delta_max = max_i64(
+        summary->delta_max, max_i64(vgetq_lane_s64(delta_max, 0), vgetq_lane_s64(delta_max, 1)));
+    summary->changes = (i - 1u) - (uint32_t)vaddvq_u64(equal);
+    sx_summarize_ints_from(values, i, count, deltas, summary);
+}
+
+/* The constants of a multiple test, in vectors. */
+typedef struct multiple_vectors {
+    uint64x2_t base;
+    int64x2_t right;
+    uint32x2_t inverse_low;
+    uint32x2_t inverse_high;
+    uint64x2_t low_bits;
+    uint64x2_t max_quotient;
+} multiple_vectors;
+
+/*
+ * Blocks of eight numbers are tested with one branch; the rest one by one. Zero is a
+ * multiple of every divisor, so blocks of zeros skip the multiplications.
+ */
+static uint32_t first_non_multiple_neon(const uint64_t* numbers, uint32_t start, uint32_t count,
+                                        uint64_t base, const sx_multiple_test* test,
+                                        uint64_t* quotients) {
+    multiple_vectors t = {
+        .base = vdupq_n_u64(base),
+        .right = vdupq_n_s64(-(int64_t)test->exact.shift),
+        .inverse_low = vdup_n_u32((uint32_t)test->exact.inverse),
+        .inverse_high = vdup_n_u32((uint32_t)(test->exact.inverse >> 32)),
+        .low_bits = vdupq_n_u64(test->low_bits),
+        .max_quotient = vdupq_n_u64(test->max_quotient),
+    };
+    bool multiply = test->max_quotient != UINT64_MAX;
+    uint32_t i = start;
+    for (; i + 4u * VECTOR_LANES <= count; i += 4u * VECTOR_LANES) {
+        uint64x2_t x[4];
+        uint64x2_t any = vdupq_n_u64(0);
+        for (uint32_t q = 0; q < 4u; q++) {
+            x[q] = vsubq_u64(vld1q_u64(numbers + i + q * VECTOR_LANES), t.base);
+            any = vorrq_u64(any, x[q]);
+        }
+        if (vmaxvq_u32(vreinterpretq_u32_u64(any)) == 0) {
+            for (uint32_t q = 0; q < 4u; q++) {
+                vst1q_u64(quotients + i + q * VECTOR_LANES, vdupq_n_u64(0));
+            }
+            continue;
+        }
+        uint64x2_t misses = vdupq_n_u64(0);
+        for (uint32_t q = 0; q < 4u; q++) {
+            uint64x2_t quotient = vshlq_u64(x[q], t.right);
+            misses = vorrq_u64(misses, vtstq_u64(x[q], t.low_bits));
+            if (multiply) {
+                quotient = multiply_u64(quotient, t.inverse_low, t.inverse_high);
+                misses = vorrq_u64(misses, vcgtq_u64(quotient, t.max_quotient));
+            }
+            vst1q_u64(quotients + i + q * VECTOR_LANES, quotient);
+        }
+        if (vmaxvq_u32(vreinterpretq_u32_u64(misses)) != 0) {
+            break;
+        }
+    }
+    return sx_first_non_multiple_from(numbers, i, count, base, test, quotients);
+}
+
+static void divide_exact_neon(const uint64_t* numbers, uint32_t count, uint64_t base,
+                              const sx_exact_divisor* divisor, uint64_t* out) {
+    uint64x2_t base_vector = vdupq_n_u64(base);
+    int64x2_t right = vdupq_n_s64(-(int64_t)divisor->shift);
+    uint32x2_t inverse_low = vdup_n_u32((uint32_t)divisor->inverse);
+    uint32x2_t inverse_high = vdup_n_u32((uint32_t)(divisor->inverse >> 32));
+    bool multiply = divisor->inverse != 1;
+    uint32_t i = 0;
+    for (; i + VECTOR_LANES <= count; i += VECTOR_LANES) {
+        uint64x2_t quotient = vshlq_u64(vsubq_u64(vld1q_u64(numbers + i), base_vector), right);
+        if (multiply) {
+            quotient = multiply_u64(quotient, inverse_low, inverse_high);
+        }
+        vst1q_u64(out + i, quotient);
+    }
+    for (; i < count; i++) {
+        out[i] = sx_divide_exact(numbers[i] - base, divisor);
+    }
+}
+
+/* NEON has no leading zero count of 64-bit lanes; the scalar histogram is as fast. */
+static void width_counts_neon(const uint64_t* numbers, uint32_t count, uint32_t max_width,
+                              uint32_t* counts) {
+    memset(counts, 0, ((size_t)max_width + 1u) * sizeof(uint32_t));
+    sx_add_width_counts(numbers, count, max_width, counts);
+}
+
+/* Blocks of four offsets without an exception are copied with vector stores; blocks with
+ * one go through the scalar loop. */
+static uint32_t split_exceptions_neon(const uint64_t* offsets, uint32_t count, uint64_t limit,
+                                      uint64_t* packed, uint16_t* positions, uint64_t* exceptions) {
+    uint64x2_t limit_vector = vdupq_n_u64(limit);
+    uint32_t exception_count = 0;
+    uint32_t i = 0;
+    for (; i + 2u * VECTOR_LANES <= count; i += 2u * VECTOR_LANES) {
+        uint64x2_t low = vld1q_u64(offsets + i);
+        uint64x2_t high = vld1q_u64(offsets + i + VECTOR_LANES);
+        uint64x2_t wide = vorrq_u64(vcgtq_u64(low, limit_vector), vcgtq_u64(high, limit_vector));
+        if (vmaxvq_u32(vreinterpretq_u32_u64(wide)) != 0) {
+            exception_count =
+                sx_split_exceptions_from(offsets, i, i + 2u * VECTOR_LANES, limit, packed,
+                                         positions, exceptions, exception_count);
+            continue;
+        }
+        vst1q_u64(packed + i, low);
+        vst1q_u64(packed + i + VECTOR_LANES, high);
+    }
+    return sx_split_exceptions_from(offsets, i, count, limit, packed, positions, exceptions,
+                                    exception_count);
+}
+
+/* The values of `lane` in rows [row, row + 2): zero where the lane has none. */
+static inline uint64x2_t lane_pair(const uint64_t* values, uint32_t count, uint32_t rows,
+                                   uint32_t lane, uint32_t row) {
+    uint32_t start = lane * rows + row;
+    uint32_t in_lane = rows - row < 2u ? rows - row : 2u;
+    uint32_t available = start < count ? count - start : 0;
+    uint32_t present = available < in_lane ? available : in_lane;
+    if (present == 2u) {
+        return vld1q_u64(values + start);
+    }
+    if (present == 1u) {
+        return vsetq_lane_u64(values[start], vdupq_n_u64(0), 0);
+    }
+    return vdupq_n_u64(0);
+}
+
+/*
+ * Each 2x2 block of the output (two rows of two lanes) is transposed from two runs of two
+ * values, one per lane. Blocks of full lanes are loaded directly.
+ */
+static void to_lane_order_neon(const uint64_t* values, uint32_t count, uint64_t* out) {
+    uint32_t rows = sx_bitpack_rows(count);
+    for (uint32_t lane = 0; lane < SX_BITPACK_LANES; lane += VECTOR_LANES) {
+        for (uint32_t row = 0; row < rows; row += 2u) {
+            uint64x2_t first;
+            uint64x2_t second;
+            if (row + 2u <= rows && (lane + 1u) * rows + row + 2u <= count) {
+                first = vld1q_u64(values + (size_t)lane * rows + row);
+                second = vld1q_u64(values + (size_t)(lane + 1u) * rows + row);
+            } else {
+                first = lane_pair(values, count, rows, lane, row);
+                second = lane_pair(values, count, rows, lane + 1u, row);
+            }
+            uint64_t* dst = out + (size_t)row * SX_BITPACK_LANES + lane;
+            vst1q_u64(dst, vzip1q_u64(first, second));
+            if (row + 1u < rows) {
+                vst1q_u64(dst + SX_BITPACK_LANES, vzip2q_u64(first, second));
+            }
+        }
+    }
+}
+
 const sx_codec_kernels sx_kernels_neon = {
     .level = SX_SIMD_NEON,
     .bitpack = bitpack_neon,
@@ -385,6 +573,12 @@ const sx_codec_kernels sx_kernels_neon = {
     .decode_alp = decode_alp_neon,
     .rebuild_deltas = rebuild_deltas_neon,
     .encode_alp = encode_alp_neon,
+    .summarize_ints = summarize_ints_neon,
+    .first_non_multiple = first_non_multiple_neon,
+    .divide_exact = divide_exact_neon,
+    .width_counts = width_counts_neon,
+    .split_exceptions = split_exceptions_neon,
+    .to_lane_order = to_lane_order_neon,
 };
 
 #endif /* SX_ARCH_ARM64 */

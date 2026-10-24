@@ -5,15 +5,17 @@
  * instruction set. See docs/DESIGN.md section 4.2.
  *
  * Every kernel exists as portable C (kernels_scalar.c), which is the reference, and as
- * AVX2 and AVX-512 versions on x86_64 and a NEON version on ARM64. The best set the CPU
- * supports is chosen on first use. Every implementation produces exactly the same output
- * as the portable one for every input, corrupted payloads included; the unit tests check
- * this for each set the machine supports.
+ * versions for the x86-64-v3 (AVX2) and x86-64-v4 (AVX-512) levels on x86_64 and a NEON
+ * version on ARM64; where a vector version does not pay off, a set uses the scalar steps
+ * of kernels_int.h. The best set the CPU supports is chosen on first use. Every
+ * implementation produces exactly the same output as the portable one for every input,
+ * corrupted payloads included; the unit tests check this for each set the machine
+ * supports.
  *
- * Kernels trust their arguments: widths are at most 64, counts are 1 to SX_VECTOR_SIZE,
- * and packed input holds sx_bitpack_size(count, width) bytes. Codecs validate payloads
- * before calling a kernel. Kernels that write whole rows need room for
- * sx_bitpack_padded_count(count) values in `out`.
+ * Kernels trust their arguments: widths are at most 64, counts are 1 to SX_VECTOR_SIZE
+ * unless a kernel says otherwise, and packed input holds sx_bitpack_size(count, width)
+ * bytes. Codecs validate payloads before calling a kernel. Kernels that write whole rows
+ * need room for sx_bitpack_padded_count(count) values in `out`.
  */
 
 #ifndef SX_ENCODING_KERNELS_H
@@ -47,6 +49,34 @@ typedef struct sx_alp_digit_range {
     int64_t min; /* INT64_MAX if every value is an exception */
     int64_t max; /* INT64_MIN if every value is an exception */
 } sx_alp_digit_range;
+
+/*
+ * Range of a chunk of integers and of its deltas (values[i + 1] - values[i], wrapping
+ * modulo 2^64 and read as signed), which decide its encoding (see int_codec.c).
+ */
+typedef struct sx_int_summary {
+    int64_t min;
+    int64_t max;
+    int64_t delta_min; /* 0 if there are no deltas */
+    int64_t delta_max; /* 0 if there are no deltas */
+    uint32_t changes;  /* number of deltas that are not zero */
+} sx_int_summary;
+
+/*
+ * Division by a divisor that is known to divide every dividend exactly, and a test for
+ * that, both with one shift and one multiplication instead of a slow division; see
+ * sx_exact_divisor_make and sx_multiple_test_make below.
+ */
+typedef struct sx_exact_divisor {
+    uint32_t shift;   /* factors of two of the divisor */
+    uint64_t inverse; /* inverse of the odd part modulo 2^64 */
+} sx_exact_divisor;
+
+typedef struct sx_multiple_test {
+    sx_exact_divisor exact;
+    uint64_t low_bits;     /* bits that must be zero in a multiple */
+    uint64_t max_quotient; /* largest quotient of a multiple */
+} sx_multiple_test;
 
 typedef struct sx_codec_kernels {
     sx_simd_level level;
@@ -92,6 +122,55 @@ typedef struct sx_codec_kernels {
      */
     uint32_t (*encode_alp)(const double* values, uint32_t count, const sx_alp_scales* scales,
                            int64_t* digits, uint64_t* exception_bits, sx_alp_digit_range* range);
+
+    /*
+     * Fills `summary` for the `count` values and writes their count - 1 deltas to
+     * `deltas`.
+     */
+    void (*summarize_ints)(const int64_t* values, uint32_t count, uint64_t* deltas,
+                           sx_int_summary* summary);
+
+    /*
+     * Index of the first i in [start, count) for which numbers[i] - base (wrapping) is not
+     * a multiple according to `test`, or `count` if there is none. Writes the quotients
+     * sx_divide_exact(numbers[i] - base, &test->exact) of the multiples, i in [start,
+     * result), to `quotients`, and may write anything to quotients[result, count). `start`
+     * may be equal to `count`, and `count` may be 0.
+     */
+    uint32_t (*first_non_multiple)(const uint64_t* numbers, uint32_t start, uint32_t count,
+                                   uint64_t base, const sx_multiple_test* test,
+                                   uint64_t* quotients);
+
+    /*
+     * out[i] = sx_divide_exact(numbers[i] - base, divisor) for i < count, wrapping. `out`
+     * may be `numbers`; `count` may be 0.
+     */
+    void (*divide_exact)(const uint64_t* numbers, uint32_t count, uint64_t base,
+                         const sx_exact_divisor* divisor, uint64_t* out);
+
+    /*
+     * Sets counts[w], for every w from 0 to max_width, to the number of the `count`
+     * numbers that are exactly w bits wide. No number may be wider than max_width (at
+     * most 64).
+     */
+    void (*width_counts)(const uint64_t* numbers, uint32_t count, uint32_t max_width,
+                         uint32_t* counts);
+
+    /*
+     * Splits offsets for DELTA_PATCHED: packed[i] is offsets[i], or 0 if offsets[i] >
+     * limit; those offsets are the exceptions, whose indexes and values are written in
+     * order to `positions` and `exceptions`, which need room for `count` entries. Returns
+     * the number of exceptions.
+     */
+    uint32_t (*split_exceptions)(const uint64_t* offsets, uint32_t count, uint64_t limit,
+                                 uint64_t* packed, uint16_t* positions, uint64_t* exceptions);
+
+    /*
+     * Reorders `count` values into the lane-contiguous order of bitpack.h: value i goes to
+     * lane i / rows, row i % rows. Writes sx_bitpack_padded_count(count) values; the
+     * padding positions are zero.
+     */
+    void (*to_lane_order)(const uint64_t* values, uint32_t count, uint64_t* out);
 } sx_codec_kernels;
 
 /* The kernel set in use. The first call chooses the best set the CPU supports. */
@@ -156,6 +235,59 @@ static inline bool sx_alp_encode_value(double value, const sx_alp_scales* scales
     *digits = (int64_t)candidate;
     bool in_range = scaled > -SX_ALP_ROUND_LIMIT && scaled < SX_ALP_ROUND_LIMIT;
     return in_range && sx_double_to_bits(decoded) == sx_double_to_bits(value);
+}
+
+/* ---------------------------------------------------------------------------------------- */
+/* Exact division shared by every kernel and by the codec                                   */
+/* ---------------------------------------------------------------------------------------- */
+
+/*
+ * For a divisor d = odd * 2^shift that divides the dividend exactly, shifting out the
+ * factors of two and multiplying by the inverse of the odd part modulo 2^64 gives the
+ * quotient. A divisor of 0 (all dividends are 0) divides by 1.
+ */
+static inline sx_exact_divisor sx_exact_divisor_make(uint64_t divisor) {
+    sx_exact_divisor result = {.shift = 0, .inverse = 1};
+    if (divisor == 0) {
+        return result;
+    }
+    result.shift = sx_trailing_zeros_u64(divisor);
+    uint64_t odd = divisor >> result.shift;
+    /* Newton's iteration doubles the correct low bits each step: 3, 6, 12, 24, 48, 96. */
+    uint64_t inverse = odd;
+    for (int step = 0; step < 5; step++) {
+        inverse *= 2u - odd * inverse;
+    }
+    result.inverse = inverse;
+    return result;
+}
+
+static inline uint64_t sx_divide_exact(uint64_t dividend, const sx_exact_divisor* divisor) {
+    return (dividend >> divisor->shift) * divisor->inverse;
+}
+
+/*
+ * x is a multiple of d = odd * 2^shift exactly when its low `shift` bits are zero and
+ * (x >> shift) * inverse(odd) (mod 2^64) is at most (2^64 - 1) / odd. The only multiple
+ * of 0 is 0: all bits must be zero and any quotient passes.
+ */
+static inline sx_multiple_test sx_multiple_test_make(uint64_t divisor) {
+    sx_multiple_test test;
+    test.exact = sx_exact_divisor_make(divisor);
+    if (divisor == 0) {
+        test.low_bits = UINT64_MAX;
+        test.max_quotient = UINT64_MAX;
+        return test;
+    }
+    test.low_bits = sx_low_mask_u64(test.exact.shift);
+    test.max_quotient = UINT64_MAX / (divisor >> test.exact.shift);
+    return test;
+}
+
+/* Zero exactly when x is a multiple; computed without branches. */
+static inline uint64_t sx_multiple_miss(uint64_t x, const sx_multiple_test* test) {
+    uint64_t quotient = sx_divide_exact(x, &test->exact);
+    return (x & test->low_bits) | (uint64_t)(quotient > test->max_quotient);
 }
 
 #endif /* SX_ENCODING_KERNELS_H */

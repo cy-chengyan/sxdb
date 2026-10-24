@@ -13,6 +13,10 @@
 #include <sys/types.h>
 #endif
 
+#if defined(SX_ARCH_X86_64)
+#include <cpuid.h>
+#endif
+
 #if defined(__linux__) && defined(SX_ARCH_ARM64)
 #include <asm/hwcap.h>
 #include <sys/auxv.h>
@@ -136,21 +140,41 @@ bool sx_os_cpu_has_crc32c(void) {
 #endif
 }
 
+#if defined(SX_ARCH_X86_64)
+/*
+ * LZCNT is CPUID leaf 0x80000001, ECX bit 5. Unlike the other features it cannot be
+ * tested with __builtin_cpu_supports on every supported compiler.
+ */
+static bool cpu_has_lzcnt(void) {
+    unsigned int eax = 0;
+    unsigned int ebx = 0;
+    unsigned int ecx = 0;
+    unsigned int edx = 0;
+    if (__get_cpuid(0x80000001u, &eax, &ebx, &ecx, &edx) == 0) {
+        return false;
+    }
+    return (ecx & (1u << 5)) != 0;
+}
+#endif
+
 /*
  * __builtin_cpu_supports also checks (with XGETBV) that the operating system saves the
  * vector registers, so a true result means the instructions can be used.
  */
-bool sx_os_cpu_has_avx2(void) {
+bool sx_os_cpu_has_x86_64_v3(void) {
 #if defined(SX_ARCH_X86_64)
-    return __builtin_cpu_supports("avx2");
+    return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("bmi") &&
+           __builtin_cpu_supports("bmi2") && __builtin_cpu_supports("popcnt") && cpu_has_lzcnt();
 #else
     return false;
 #endif
 }
 
-bool sx_os_cpu_has_avx512(void) {
+bool sx_os_cpu_has_x86_64_v4(void) {
 #if defined(SX_ARCH_X86_64)
-    return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512dq");
+    return sx_os_cpu_has_x86_64_v3() && __builtin_cpu_supports("avx512f") &&
+           __builtin_cpu_supports("avx512cd") && __builtin_cpu_supports("avx512bw") &&
+           __builtin_cpu_supports("avx512dq") && __builtin_cpu_supports("avx512vl");
 #else
     return false;
 #endif
