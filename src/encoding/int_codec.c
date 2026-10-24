@@ -69,6 +69,7 @@ static uint64_t offset_from(int64_t value, int64_t base) {
 static uint64_t common_divisor(const sx_codec_kernels* kernels, const uint64_t* numbers,
                                uint32_t count, uint64_t base, uint64_t* quotients) {
     uint64_t divisor = 0;
+    sx_exact_divisor exact = {.shift = 0, .inverse = 1}; /* for 0 and 1: no division */
     uint32_t settled = 0; /* quotients[settled, tested) are by the current divisor */
     uint32_t tested = 0;
     while (divisor != 1) {
@@ -77,13 +78,13 @@ static uint64_t common_divisor(const sx_codec_kernels* kernels, const uint64_t* 
             kernels->first_non_multiple(numbers, settled, count, base, &test, quotients);
         if (miss == count) {
             tested = count;
+            exact = test.exact;
             break;
         }
         divisor = sx_gcd_u64(divisor, numbers[miss] - base);
         settled = miss + 1u;
         tested = settled;
     }
-    sx_exact_divisor exact = sx_exact_divisor_make(divisor);
     kernels->divide_exact(numbers, settled, base, &exact, quotients);
     kernels->divide_exact(numbers + tested, count - tested, base, &exact, quotients + tested);
     return divisor;
@@ -112,8 +113,8 @@ static uint64_t for_multiplier(const sx_codec_kernels* kernels, const int64_t* v
 
 /* Bit width of the largest offset after dividing by the multiplier. */
 static uint32_t packed_width(uint64_t range, uint64_t multiplier) {
-    if (multiplier == 0) {
-        return 0;
+    if (multiplier <= 1) {
+        return multiplier == 0 ? 0 : sx_bit_width_u64(range); /* without a slow division */
     }
     return sx_bit_width_u64(range / multiplier);
 }
@@ -132,17 +133,36 @@ static void summarize(const int64_t* values, uint32_t count, int_stats* stats) {
     stats->delta_max = summary.delta_max;
 }
 
+/* Size of the exceptions of DELTA_PATCHED: positions, padding, and offsets. */
+static size_t exceptions_size(uint32_t exceptions) {
+    return sx_align_up((size_t)exceptions * sizeof(uint16_t), 8) +
+           (size_t)exceptions * sizeof(uint64_t);
+}
+
 /* Payload size of DELTA_PATCHED with `exceptions` offsets stored apart. */
 static size_t patched_size(uint32_t delta_count, uint32_t width, uint32_t exceptions) {
     return DELTA_PATCHED_HEADER_SIZE + sx_bitpack_size(delta_count, width) +
-           sx_align_up((size_t)exceptions * sizeof(uint16_t), 8) +
-           (size_t)exceptions * sizeof(uint64_t);
+           exceptions_size(exceptions);
+}
+
+/* The fewest exceptions whose storage alone takes at least `size` bytes. */
+static uint32_t exceptions_filling(size_t size) {
+    /* Each exception takes 10 bytes, plus at most 6 of padding in all. */
+    uint32_t exceptions = (uint32_t)(size / 10u);
+    while (exceptions_size(exceptions) < size) {
+        exceptions++;
+    }
+    return exceptions;
 }
 
 /*
  * Picks the packed width for DELTA_PATCHED. A few large gaps (a lunch break, a night, a
  * weekend) would force every delta to their width; storing them apart lets the rest be
  * packed narrowly. Every width below the full one is tried using a histogram of widths.
+ *
+ * The histogram is counted from the widest offsets down, and only as far as it matters:
+ * once the offsets at least w bits wide are so many that storing them as exceptions takes
+ * as much as packing everything at the full width, no width below w can beat DELTA_FOR.
  */
 static void choose_patch_width(int_stats* stats) {
     stats->patch_width = 0;
@@ -152,14 +172,19 @@ static void choose_patch_width(int_stats* stats) {
         return;
     }
     uint32_t delta_count = stats->count - 1;
-    uint32_t width_counts[65];
-    stats->kernels->width_counts(stats->delta_offsets, delta_count, stats->delta_width,
-                                 width_counts);
-
     size_t unpatched = DELTA_FOR_HEADER_SIZE + sx_bitpack_size(delta_count, stats->delta_width);
+    uint32_t enough = exceptions_filling(unpatched - DELTA_PATCHED_HEADER_SIZE);
+    uint32_t width_counts[65];
+    uint32_t lowest = stats->kernels->width_counts(stats->delta_offsets, delta_count,
+                                                   stats->delta_width, enough, width_counts);
+
     size_t best_size = unpatched;
-    uint32_t wider = delta_count; /* offsets wider than `width` */
-    for (uint32_t width = 0; width < stats->delta_width; width++) {
+    /* Offsets at least `lowest` bits wide; in the loop, offsets wider than `width`. */
+    uint32_t wider = 0;
+    for (uint32_t width = lowest; width <= stats->delta_width; width++) {
+        wider += width_counts[width];
+    }
+    for (uint32_t width = lowest; width < stats->delta_width; width++) {
         wider -= width_counts[width];
         size_t size = patched_size(delta_count, width, wider);
         if (size < best_size) {
@@ -232,14 +257,18 @@ static void write_packed(const sx_codec_kernels* kernels, sx_byte_writer* out,
     }
 }
 
-/* Packs delta offsets in the lane-contiguous order (see bitpack.h). */
+/*
+ * Packs delta offsets in the lane-contiguous order (see bitpack.h), those above `limit` as
+ * 0.
+ */
 static void write_packed_deltas(const sx_codec_kernels* kernels, sx_byte_writer* out,
-                                const uint64_t* offsets, uint32_t count, uint32_t width) {
+                                const uint64_t* offsets, uint32_t count, uint32_t width,
+                                uint64_t limit) {
     if (width == 0) {
         return; /* nothing is stored, as with regular timestamps and DELTA_PATCHED */
     }
     uint64_t lane_ordered[SX_VECTOR_SIZE];
-    kernels->to_lane_order(offsets, count, lane_ordered);
+    kernels->to_lane_order(offsets, count, limit, lane_ordered);
     write_packed(kernels, out, lane_ordered, sx_bitpack_padded_count(count), width, 0);
 }
 
@@ -268,19 +297,30 @@ static void encode_delta_for(const int64_t* values, const int_stats* stats, sx_b
     sx_writer_put_u8(out, (uint8_t)stats->delta_width);
     write_padding(out, HEADER_PADDING);
     write_packed_deltas(stats->kernels, out, stats->delta_offsets, stats->count - 1,
-                        stats->delta_width);
+                        stats->delta_width, UINT64_MAX);
 }
 
 static void encode_delta_patched(const int64_t* values, const int_stats* stats,
                                  sx_byte_writer* out) {
     uint32_t delta_count = stats->count - 1;
-    uint64_t packed[SX_VECTOR_SIZE];
-    uint16_t exception_positions[SX_VECTOR_SIZE];
-    uint64_t exception_offsets[SX_VECTOR_SIZE];
+    const uint64_t* offsets = stats->delta_offsets;
     /* An offset is wider than patch_width bits exactly when it exceeds this limit. */
     uint64_t limit = sx_low_mask_u64(stats->patch_width);
-    uint32_t exceptions = stats->kernels->split_exceptions(
-        stats->delta_offsets, delta_count, limit, packed, exception_positions, exception_offsets);
+    uint64_t exception_bits[SX_VECTOR_SIZE / 64u];
+    uint32_t exceptions =
+        stats->kernels->find_exceptions(offsets, delta_count, limit, exception_bits);
+    /* The exceptions are rare: they are listed from their bits, in order. */
+    uint16_t exception_positions[SX_VECTOR_SIZE];
+    uint64_t exception_offsets[SX_VECTOR_SIZE];
+    uint32_t listed = 0;
+    for (uint32_t word = 0; word * 64u < delta_count; word++) {
+        for (uint64_t bits = exception_bits[word]; bits != 0; bits &= bits - 1u) {
+            uint32_t position = word * 64u + sx_trailing_zeros_u64(bits);
+            exception_positions[listed] = (uint16_t)position;
+            exception_offsets[listed] = offsets[position];
+            listed++;
+        }
+    }
 
     sx_writer_put_i64(out, values[0]);
     sx_writer_put_i64(out, stats->delta_min);
@@ -289,7 +329,7 @@ static void encode_delta_patched(const int64_t* values, const int_stats* stats,
     write_padding(out, 1);
     sx_writer_put_u16(out, (uint16_t)exceptions);
     write_padding(out, 4);
-    write_packed_deltas(stats->kernels, out, packed, delta_count, stats->patch_width);
+    write_packed_deltas(stats->kernels, out, offsets, delta_count, stats->patch_width, limit);
     sx_writer_put_bytes(out, exception_positions, (size_t)exceptions * sizeof(uint16_t));
     sx_writer_pad_to(out, 8);
     sx_writer_put_bytes(out, exception_offsets, (size_t)exceptions * sizeof(uint64_t));

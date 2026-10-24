@@ -504,11 +504,11 @@ static inline __m512i merged_leading_zeros(const uint64_t* numbers, uint32_t pre
 
 /*
  * The numbers are merged in blocks of 64 (merged_leading_zeros), and then the bytes of all
- * blocks are counted for each width. The missing numbers of the last block are counted as
- * width 0 and taken off at the end.
+ * blocks are counted for each width, from max_width down. The missing numbers of the last
+ * block count as width 0, which is taken care of at the end.
  */
-static void width_counts_avx512(const uint64_t* numbers, uint32_t count, uint32_t max_width,
-                                uint32_t* counts) {
+static uint32_t width_counts_avx512(const uint64_t* numbers, uint32_t count, uint32_t max_width,
+                                    uint32_t enough, uint32_t* counts) {
     __m512i blocks[SX_VECTOR_SIZE / 64u];
     uint32_t block_count = 0;
     uint32_t first = 0;
@@ -520,51 +520,60 @@ static void width_counts_avx512(const uint64_t* numbers, uint32_t count, uint32_
         blocks[block_count] = merged_leading_zeros(numbers + first, count - first);
         block_count++;
     }
-    __m512i target = _mm512_set1_epi8(64);
-    __m512i one = _mm512_set1_epi8(1);
-    for (uint32_t width = 0; width <= max_width; width++) {
+    uint32_t at_least = 0;
+    for (uint32_t width = max_width; width > 0; width--) {
+        __m512i target = _mm512_set1_epi8((char)(64u - width));
         uint32_t total = 0;
         for (uint32_t b = 0; b < block_count; b++) {
             total += sx_popcount_u64(_mm512_cmpeq_epi8_mask(blocks[b], target));
         }
         counts[width] = total;
-        target = _mm512_sub_epi8(target, one);
-    }
-    counts[0] -= block_count * 64u - count;
-}
-
-/* Copies offsets within the limit and returns the lanes of `valid` that exceed it. */
-static inline __mmask8 split_vector(const uint64_t* offsets, __mmask8 valid, __m512i limit,
-                                    uint64_t* packed) {
-    __m512i x = _mm512_maskz_loadu_epi64(valid, offsets);
-    __mmask8 wide = _mm512_mask_cmpgt_epu64_mask(valid, x, limit);
-    _mm512_mask_storeu_epi64(packed, valid, _mm512_maskz_mov_epi64((__mmask8)~wide, x));
-    return wide;
-}
-
-static uint32_t split_exceptions_avx512(const uint64_t* offsets, uint32_t count, uint64_t limit,
-                                        uint64_t* packed, uint16_t* positions,
-                                        uint64_t* exceptions) {
-    __m512i limit_vector = _mm512_set1_epi64((long long)limit);
-    uint32_t exception_count = 0;
-    for (uint32_t i = 0; i < count; i += VECTOR_LANES) {
-        uint32_t wide = split_vector(offsets + i, first_lanes(count - i), limit_vector, packed + i);
-        for (; wide != 0; wide &= wide - 1u) {
-            uint32_t index = i + sx_trailing_zeros_u64(wide);
-            positions[exception_count] = (uint16_t)index;
-            exceptions[exception_count] = offsets[index];
-            exception_count++;
+        at_least += total;
+        if (at_least >= enough) {
+            return width;
         }
     }
-    return exception_count;
+    counts[0] = count - at_least;
+    return 0;
+}
+
+/*
+ * Each word of 64 exception bits is built from the comparison masks of eight vectors in a
+ * register; the last vector of the last word is masked.
+ */
+static uint32_t find_exceptions_avx512(const uint64_t* offsets, uint32_t count, uint64_t limit,
+                                       uint64_t* bits) {
+    __m512i limit_vector = _mm512_set1_epi64((long long)limit);
+    uint32_t exceptions = 0;
+    for (uint32_t word = 0; word * 64u < count; word++) {
+        uint64_t word_bits = 0;
+        for (uint32_t k = 0; k < 8u; k++) {
+            uint32_t first = word * 64u + k * (uint32_t)VECTOR_LANES;
+            if (first >= count) {
+                break;
+            }
+            __mmask8 valid = first_lanes(count - first);
+            __m512i x = _mm512_maskz_loadu_epi64(valid, offsets + first);
+            __mmask8 wide = _mm512_mask_cmpgt_epu64_mask(valid, x, limit_vector);
+            word_bits |= (uint64_t)wide << (8u * k);
+        }
+        bits[word] = word_bits;
+        exceptions += sx_popcount_u64(word_bits);
+    }
+    return exceptions;
 }
 
 /*
  * Each 8x8 block of the output (eight rows of eight lanes) comes from eight runs of eight
  * values, one per lane, and is transposed from them. Blocks of full lanes are loaded
- * directly; at the end of the lanes, missing values are loaded as zeros.
+ * directly; at the end of the lanes, missing values are loaded as zeros. Values above the
+ * limit are cleared as they are loaded; the comparison competes with the transposition
+ * for the same execution port, so it is left out when there is no limit.
  */
-static void to_lane_order_avx512(const uint64_t* values, uint32_t count, uint64_t* out) {
+static void to_lane_order_avx512(const uint64_t* values, uint32_t count, uint64_t limit,
+                                 uint64_t* out) {
+    __m512i limit_vector = _mm512_set1_epi64((long long)limit);
+    bool clear = limit != UINT64_MAX;
     uint32_t rows = sx_bitpack_rows(count);
     for (uint32_t first_lane = 0; first_lane < SX_BITPACK_LANES; first_lane += VECTOR_LANES) {
         for (uint32_t row = 0; row < rows; row += 8u) {
@@ -574,16 +583,18 @@ static void to_lane_order_avx512(const uint64_t* values, uint32_t count, uint64_
             for (uint32_t j = 0; j < 8u; j++) {
                 /* Values of lane first_lane + j in rows [row, row + 8). */
                 uint32_t start = (first_lane + j) * rows + row;
-                if (full) {
-                    block[j] = _mm512_loadu_si512(values + start);
-                    continue;
+                __mmask8 present = 0xff;
+                if (!full) {
+                    uint32_t in_lane = rows - row < 8u ? rows - row : 8u;
+                    uint32_t available = start < count ? count - start : 0;
+                    present = first_lanes(available < in_lane ? available : in_lane);
                 }
-                uint32_t in_lane = rows - row < 8u ? rows - row : 8u;
-                uint32_t available = start < count ? count - start : 0;
-                uint32_t present = available < in_lane ? available : in_lane;
-                block[j] = present == 0
-                               ? _mm512_setzero_si512()
-                               : _mm512_maskz_loadu_epi64(first_lanes(present), values + start);
+                __m512i v = present == 0 ? _mm512_setzero_si512()
+                                         : _mm512_maskz_loadu_epi64(present, values + start);
+                if (clear) {
+                    v = _mm512_maskz_mov_epi64(_mm512_cmple_epu64_mask(v, limit_vector), v);
+                }
+                block[j] = v;
             }
             transpose_8x8(block);
             for (uint32_t j = 0; j < 8u && row + j < rows; j++) {
@@ -606,7 +617,7 @@ const sx_codec_kernels sx_kernels_avx512 = {
     .first_non_multiple = first_non_multiple_avx512,
     .divide_exact = divide_exact_avx512,
     .width_counts = width_counts_avx512,
-    .split_exceptions = split_exceptions_avx512,
+    .find_exceptions = find_exceptions_avx512,
     .to_lane_order = to_lane_order_avx512,
 };
 

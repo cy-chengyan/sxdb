@@ -149,28 +149,27 @@ typedef struct sx_codec_kernels {
                          const sx_exact_divisor* divisor, uint64_t* out);
 
     /*
-     * Sets counts[w], for every w from 0 to max_width, to the number of the `count`
-     * numbers that are exactly w bits wide. No number may be wider than max_width (at
-     * most 64).
+     * Counts the `count` numbers of each width, from max_width (at most 64; no number may
+     * be wider) down: sets counts[w] to how many are exactly w bits wide, and stops at the
+     * first w at which `enough` numbers are at least w bits wide, or at 0. Returns that
+     * last width w; counts below it are not set.
      */
-    void (*width_counts)(const uint64_t* numbers, uint32_t count, uint32_t max_width,
-                         uint32_t* counts);
+    uint32_t (*width_counts)(const uint64_t* numbers, uint32_t count, uint32_t max_width,
+                             uint32_t enough, uint32_t* counts);
 
     /*
-     * Splits offsets for DELTA_PATCHED: packed[i] is offsets[i], or 0 if offsets[i] >
-     * limit; those offsets are the exceptions, whose indexes and values are written in
-     * order to `positions` and `exceptions`, which need room for `count` entries. Returns
-     * the number of exceptions.
+     * Sets bit i of `bits` (ceil(count / 64) words, unused bits cleared) for every offset
+     * above `limit`: the exceptions of DELTA_PATCHED. Returns how many there are.
      */
-    uint32_t (*split_exceptions)(const uint64_t* offsets, uint32_t count, uint64_t limit,
-                                 uint64_t* packed, uint16_t* positions, uint64_t* exceptions);
+    uint32_t (*find_exceptions)(const uint64_t* offsets, uint32_t count, uint64_t limit,
+                                uint64_t* bits);
 
     /*
      * Reorders `count` values into the lane-contiguous order of bitpack.h: value i goes to
-     * lane i / rows, row i % rows. Writes sx_bitpack_padded_count(count) values; the
-     * padding positions are zero.
+     * lane i / rows, row i % rows. Values above `limit` are written as 0 (UINT64_MAX keeps
+     * all). Writes sx_bitpack_padded_count(count) values; the padding positions are zero.
      */
-    void (*to_lane_order)(const uint64_t* values, uint32_t count, uint64_t* out);
+    void (*to_lane_order)(const uint64_t* values, uint32_t count, uint64_t limit, uint64_t* out);
 } sx_codec_kernels;
 
 /* The kernel set in use. The first call chooses the best set the CPU supports. */
@@ -253,9 +252,13 @@ static inline sx_exact_divisor sx_exact_divisor_make(uint64_t divisor) {
     }
     result.shift = sx_trailing_zeros_u64(divisor);
     uint64_t odd = divisor >> result.shift;
-    /* Newton's iteration doubles the correct low bits each step: 3, 6, 12, 24, 48, 96. */
-    uint64_t inverse = odd;
-    for (int step = 0; step < 5; step++) {
+    if (odd == 1) {
+        return result; /* a power of two: the shift alone */
+    }
+    /* (3 * odd) XOR 2 is the inverse modulo 2^5, and Newton's iteration doubles the
+     * correct low bits each step: 10, 20, 40, 80. */
+    uint64_t inverse = (3u * odd) ^ 2u;
+    for (int step = 0; step < 4; step++) {
         inverse *= 2u - odd * inverse;
     }
     result.inverse = inverse;
@@ -280,7 +283,8 @@ static inline sx_multiple_test sx_multiple_test_make(uint64_t divisor) {
         return test;
     }
     test.low_bits = sx_low_mask_u64(test.exact.shift);
-    test.max_quotient = UINT64_MAX / (divisor >> test.exact.shift);
+    uint64_t odd = divisor >> test.exact.shift;
+    test.max_quotient = odd == 1 ? UINT64_MAX : UINT64_MAX / odd;
     return test;
 }
 

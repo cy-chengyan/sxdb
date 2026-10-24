@@ -93,25 +93,50 @@ static inline void sx_add_width_counts(const uint64_t* numbers, uint32_t count, 
 }
 
 /*
- * split_exceptions for offsets[begin, count), after `exception_count` exceptions found
- * before `begin`; returns the new number of exceptions. Exceptions are rare, so the
- * branch for them is well predicted.
+ * The width at which width_counts stops (see kernels.h), from the counts of every width up
+ * to max_width: the first w, counting down, at which `enough` numbers are at least w bits
+ * wide, or 0.
  */
-static inline uint32_t sx_split_exceptions_from(const uint64_t* offsets, uint32_t begin,
-                                                uint32_t count, uint64_t limit, uint64_t* packed,
-                                                uint16_t* positions, uint64_t* exceptions,
-                                                uint32_t exception_count) {
-    for (uint32_t i = begin; i < count; i++) {
-        uint64_t offset = offsets[i];
-        packed[i] = offset;
-        if (offset > limit) {
-            packed[i] = 0;
-            positions[exception_count] = (uint16_t)i;
-            exceptions[exception_count] = offset;
-            exception_count++;
+static inline uint32_t sx_width_counts_stop(const uint32_t* counts, uint32_t max_width,
+                                            uint32_t enough) {
+    uint32_t at_least = 0;
+    for (uint32_t width = max_width; width > 0; width--) {
+        at_least += counts[width];
+        if (at_least >= enough) {
+            return width;
         }
     }
-    return exception_count;
+    return 0;
+}
+
+/*
+ * Bit i - begin is set for each offsets[i] above `limit`, i in [begin, end), at most 64.
+ * Exceptions are rare, so the offsets are first only counted, which needs no shifts and
+ * vectorizes; the bits are set only for words with an exception, eight at a time with
+ * fixed shifts.
+ */
+static inline uint64_t sx_exception_word(const uint64_t* offsets, uint32_t begin, uint32_t end,
+                                         uint64_t limit) {
+    uint32_t above = 0;
+    for (uint32_t i = begin; i < end; i++) {
+        above += (uint32_t)(offsets[i] > limit);
+    }
+    if (above == 0) {
+        return 0;
+    }
+    uint64_t word = 0;
+    uint32_t i = begin;
+    for (; i + 8u <= end; i += 8u) {
+        uint64_t byte = 0;
+        for (uint32_t j = 0; j < 8u; j++) {
+            byte |= (uint64_t)(offsets[i + j] > limit) << j;
+        }
+        word |= byte << (i - begin);
+    }
+    for (; i < end; i++) {
+        word |= (uint64_t)(offsets[i] > limit) << (i - begin);
+    }
+    return word;
 }
 
 /* first_non_multiple for numbers[start, count), one number at a time. */

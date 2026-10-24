@@ -163,27 +163,43 @@ static void divide_exact_scalar(const uint64_t* numbers, uint32_t count, uint64_
     }
 }
 
-static void width_counts_scalar(const uint64_t* numbers, uint32_t count, uint32_t max_width,
-                                uint32_t* counts) {
+static uint32_t width_counts_scalar(const uint64_t* numbers, uint32_t count, uint32_t max_width,
+                                    uint32_t enough, uint32_t* counts) {
     memset(counts, 0, ((size_t)max_width + 1u) * sizeof(uint32_t));
     sx_add_width_counts(numbers, count, max_width, counts);
+    return sx_width_counts_stop(counts, max_width, enough);
 }
 
-static uint32_t split_exceptions_scalar(const uint64_t* offsets, uint32_t count, uint64_t limit,
-                                        uint64_t* packed, uint16_t* positions,
-                                        uint64_t* exceptions) {
-    return sx_split_exceptions_from(offsets, 0, count, limit, packed, positions, exceptions, 0);
+static uint32_t find_exceptions_scalar(const uint64_t* offsets, uint32_t count, uint64_t limit,
+                                       uint64_t* bits) {
+    uint32_t exceptions = 0;
+    for (uint32_t word = 0; word * 64u < count; word++) {
+        uint32_t begin = word * 64u;
+        uint32_t end = count - begin < 64u ? count : begin + 64u;
+        bits[word] = sx_exception_word(offsets, begin, end, limit);
+        exceptions += sx_popcount_u64(bits[word]);
+    }
+    return exceptions;
 }
 
-static void to_lane_order_scalar(const uint64_t* values, uint32_t count, uint64_t* out) {
+static void to_lane_order_scalar(const uint64_t* values, uint32_t count, uint64_t limit,
+                                 uint64_t* out) {
     uint32_t rows = sx_bitpack_rows(count);
     memset(out, 0, (size_t)rows * SX_BITPACK_ROW_BYTES);
-    /* Lane l takes the run of values starting at l * rows. */
+    /* Lane l takes the run of values starting at l * rows. Without a limit, the copy is a
+     * plain one. */
     for (uint32_t lane = 0; lane < SX_BITPACK_LANES && lane * rows < count; lane++) {
         const uint64_t* run = values + (size_t)lane * rows;
+        uint64_t* lane_out = out + lane;
         uint32_t run_length = count - lane * rows < rows ? count - lane * rows : rows;
-        for (uint32_t row = 0; row < run_length; row++) {
-            out[(size_t)row * SX_BITPACK_LANES + lane] = run[row];
+        if (limit == UINT64_MAX) {
+            for (uint32_t row = 0; row < run_length; row++) {
+                lane_out[(size_t)row * SX_BITPACK_LANES] = run[row];
+            }
+        } else {
+            for (uint32_t row = 0; row < run_length; row++) {
+                lane_out[(size_t)row * SX_BITPACK_LANES] = run[row] > limit ? 0 : run[row];
+            }
         }
     }
 }
@@ -200,6 +216,6 @@ const sx_codec_kernels sx_kernels_scalar = {
     .first_non_multiple = first_non_multiple_scalar,
     .divide_exact = divide_exact_scalar,
     .width_counts = width_counts_scalar,
-    .split_exceptions = split_exceptions_scalar,
+    .find_exceptions = find_exceptions_scalar,
     .to_lane_order = to_lane_order_scalar,
 };

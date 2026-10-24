@@ -493,34 +493,24 @@ static void divide_exact_neon(const uint64_t* numbers, uint32_t count, uint64_t 
 }
 
 /* NEON has no leading zero count of 64-bit lanes; the scalar histogram is as fast. */
-static void width_counts_neon(const uint64_t* numbers, uint32_t count, uint32_t max_width,
-                              uint32_t* counts) {
+static uint32_t width_counts_neon(const uint64_t* numbers, uint32_t count, uint32_t max_width,
+                                  uint32_t enough, uint32_t* counts) {
     memset(counts, 0, ((size_t)max_width + 1u) * sizeof(uint32_t));
     sx_add_width_counts(numbers, count, max_width, counts);
+    return sx_width_counts_stop(counts, max_width, enough);
 }
 
-/* Blocks of four offsets without an exception are copied with vector stores; blocks with
- * one go through the scalar loop. */
-static uint32_t split_exceptions_neon(const uint64_t* offsets, uint32_t count, uint64_t limit,
-                                      uint64_t* packed, uint16_t* positions, uint64_t* exceptions) {
-    uint64x2_t limit_vector = vdupq_n_u64(limit);
-    uint32_t exception_count = 0;
-    uint32_t i = 0;
-    for (; i + 2u * VECTOR_LANES <= count; i += 2u * VECTOR_LANES) {
-        uint64x2_t low = vld1q_u64(offsets + i);
-        uint64x2_t high = vld1q_u64(offsets + i + VECTOR_LANES);
-        uint64x2_t wide = vorrq_u64(vcgtq_u64(low, limit_vector), vcgtq_u64(high, limit_vector));
-        if (vmaxvq_u32(vreinterpretq_u32_u64(wide)) != 0) {
-            exception_count =
-                sx_split_exceptions_from(offsets, i, i + 2u * VECTOR_LANES, limit, packed,
-                                         positions, exceptions, exception_count);
-            continue;
-        }
-        vst1q_u64(packed + i, low);
-        vst1q_u64(packed + i + VECTOR_LANES, high);
+/* Two lanes per vector gain nothing over building each word of bits with scalar code. */
+static uint32_t find_exceptions_neon(const uint64_t* offsets, uint32_t count, uint64_t limit,
+                                     uint64_t* bits) {
+    uint32_t exceptions = 0;
+    for (uint32_t word = 0; word * 64u < count; word++) {
+        uint32_t begin = word * 64u;
+        uint32_t end = count - begin < 64u ? count : begin + 64u;
+        bits[word] = sx_exception_word(offsets, begin, end, limit);
+        exceptions += sx_popcount_u64(bits[word]);
     }
-    return sx_split_exceptions_from(offsets, i, count, limit, packed, positions, exceptions,
-                                    exception_count);
+    return exceptions;
 }
 
 /* The values of `lane` in rows [row, row + 2): zero where the lane has none. */
@@ -541,9 +531,13 @@ static inline uint64x2_t lane_pair(const uint64_t* values, uint32_t count, uint3
 
 /*
  * Each 2x2 block of the output (two rows of two lanes) is transposed from two runs of two
- * values, one per lane. Blocks of full lanes are loaded directly.
+ * values, one per lane. Blocks of full lanes are loaded directly. Values above the limit
+ * are cleared before the transposition, unless there is no limit.
  */
-static void to_lane_order_neon(const uint64_t* values, uint32_t count, uint64_t* out) {
+static void to_lane_order_neon(const uint64_t* values, uint32_t count, uint64_t limit,
+                               uint64_t* out) {
+    uint64x2_t limit_vector = vdupq_n_u64(limit);
+    bool clear = limit != UINT64_MAX;
     uint32_t rows = sx_bitpack_rows(count);
     for (uint32_t lane = 0; lane < SX_BITPACK_LANES; lane += VECTOR_LANES) {
         for (uint32_t row = 0; row < rows; row += 2u) {
@@ -555,6 +549,10 @@ static void to_lane_order_neon(const uint64_t* values, uint32_t count, uint64_t*
             } else {
                 first = lane_pair(values, count, rows, lane, row);
                 second = lane_pair(values, count, rows, lane + 1u, row);
+            }
+            if (clear) {
+                first = vbicq_u64(first, vcgtq_u64(first, limit_vector));
+                second = vbicq_u64(second, vcgtq_u64(second, limit_vector));
             }
             uint64_t* dst = out + (size_t)row * SX_BITPACK_LANES + lane;
             vst1q_u64(dst, vzip1q_u64(first, second));
@@ -577,7 +575,7 @@ const sx_codec_kernels sx_kernels_neon = {
     .first_non_multiple = first_non_multiple_neon,
     .divide_exact = divide_exact_neon,
     .width_counts = width_counts_neon,
-    .split_exceptions = split_exceptions_neon,
+    .find_exceptions = find_exceptions_neon,
     .to_lane_order = to_lane_order_neon,
 };
 

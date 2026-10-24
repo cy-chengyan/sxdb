@@ -507,13 +507,20 @@ static void test_width_counts_match_scalar(void) {
                 numbers[i] =
                     width == 0 ? 0 : (sx_rng_next(&rng) | UINT64_C(1) << 63) >> (64u - width);
             }
-            scalar->width_counts(numbers, count, max_width, expected);
+            /* Stopping early, late, or never. */
+            uint32_t enough = (uint32_t)sx_rng_below(&rng, count + 2u);
+            uint32_t expected_lowest =
+                scalar->width_counts(numbers, count, max_width, enough, expected);
             for (uint32_t l = 0; l < level_count; l++) {
                 memset(actual, 0xA5, sizeof(actual));
-                level_kernels(levels[l])->width_counts(numbers, count, max_width, actual);
-                if (memcmp(actual, expected, (max_width + 1u) * sizeof(uint32_t)) != 0) {
-                    sx_test_fail(__FILE__, __LINE__, "%s width_counts differ: max %u count %u",
-                                 sx_simd_level_name(levels[l]), max_width, count);
+                uint32_t lowest = level_kernels(levels[l])->width_counts(numbers, count, max_width,
+                                                                         enough, actual);
+                if (lowest != expected_lowest ||
+                    memcmp(actual + lowest, expected + lowest,
+                           (max_width + 1u - lowest) * sizeof(uint32_t)) != 0) {
+                    sx_test_fail(__FILE__, __LINE__,
+                                 "%s width_counts differ: max %u count %u enough %u",
+                                 sx_simd_level_name(levels[l]), max_width, count, enough);
                     return;
                 }
                 for (uint32_t w = max_width + 1u; w <= 64; w++) {
@@ -524,20 +531,16 @@ static void test_width_counts_match_scalar(void) {
     }
 }
 
-static void test_split_exceptions_matches_scalar(void) {
+static void test_find_exceptions_matches_scalar(void) {
     const sx_codec_kernels* scalar = level_kernels(SX_SIMD_SCALAR);
     sx_simd_level levels[SX_SIMD_LEVEL_COUNT];
     uint32_t level_count = simd_levels(levels);
     sx_rng rng;
     sx_rng_seed(&rng, 10);
     uint64_t offsets[SX_VECTOR_SIZE];
-    uint64_t expected_packed[SX_VECTOR_SIZE];
-    uint64_t actual_packed[SX_VECTOR_SIZE];
-    uint16_t expected_positions[SX_VECTOR_SIZE];
-    uint16_t actual_positions[SX_VECTOR_SIZE];
-    uint64_t expected_exceptions[SX_VECTOR_SIZE];
-    uint64_t actual_exceptions[SX_VECTOR_SIZE];
-    for (uint32_t width = 0; width < 64; width++) {
+    uint64_t expected_bits[SX_VECTOR_SIZE / 64];
+    uint64_t actual_bits[SX_VECTOR_SIZE / 64];
+    for (uint32_t width = 0; width <= 64; width++) {
         for (size_t c = 0; c < SX_ARRAY_SIZE(counts); c++) {
             uint32_t count = counts[c];
             uint64_t limit = sx_low_mask_u64(width);
@@ -547,17 +550,21 @@ static void test_split_exceptions_matches_scalar(void) {
                 offsets[i] =
                     sx_rng_below(&rng, rarity) == 0 ? sx_rng_next(&rng) : sx_rng_next(&rng) & limit;
             }
-            uint32_t expected = scalar->split_exceptions(offsets, count, limit, expected_packed,
-                                                         expected_positions, expected_exceptions);
+            size_t words = sx_div_round_up(count, 64);
+            uint32_t expected = scalar->find_exceptions(offsets, count, limit, expected_bits);
+            uint32_t ones = 0;
+            for (uint32_t i = 0; i < count; i++) {
+                bool bit = (expected_bits[i / 64u] >> (i % 64u)) & 1u;
+                SX_CHECK(bit == (offsets[i] > limit));
+                ones += (uint32_t)bit;
+            }
+            SX_CHECK_EQ_U64(expected, ones);
             for (uint32_t l = 0; l < level_count; l++) {
-                memset(actual_packed, 0xA5, sizeof(actual_packed));
-                uint32_t actual = level_kernels(levels[l])->split_exceptions(
-                    offsets, count, limit, actual_packed, actual_positions, actual_exceptions);
+                memset(actual_bits, 0xA5, sizeof(actual_bits));
+                uint32_t actual =
+                    level_kernels(levels[l])->find_exceptions(offsets, count, limit, actual_bits);
                 SX_CHECK_EQ_U64(actual, expected);
-                SX_CHECK_EQ_MEM(actual_packed, expected_packed, count * sizeof(uint64_t));
-                SX_CHECK_EQ_MEM(actual_positions, expected_positions, expected * sizeof(uint16_t));
-                SX_CHECK_EQ_MEM(actual_exceptions, expected_exceptions,
-                                expected * sizeof(uint64_t));
+                SX_CHECK_EQ_MEM(actual_bits, expected_bits, words * sizeof(uint64_t));
             }
         }
     }
@@ -573,18 +580,45 @@ static void test_to_lane_order_matches_scalar(void) {
     uint64_t expected[SX_VECTOR_SIZE];
     uint64_t actual[SX_VECTOR_SIZE];
     for (uint32_t count = 1; count <= SX_VECTOR_SIZE; count++) {
-        fill_random(&rng, values, count * sizeof(uint64_t));
+        /* Values of up to 20 bits, some of them above the limit. */
+        for (uint32_t i = 0; i < count; i++) {
+            values[i] = sx_rng_next(&rng) >> (44u + sx_rng_below(&rng, 4));
+        }
+        uint64_t limit = count % 3u == 0 ? UINT64_MAX : sx_low_mask_u64(count % 21u);
         size_t size = sx_bitpack_padded_count(count) * sizeof(uint64_t);
-        scalar->to_lane_order(values, count, expected);
+        scalar->to_lane_order(values, count, limit, expected);
         for (uint32_t l = 0; l < level_count; l++) {
             fill_random(&rng, actual, sizeof(actual));
-            level_kernels(levels[l])->to_lane_order(values, count, actual);
+            level_kernels(levels[l])->to_lane_order(values, count, limit, actual);
             if (memcmp(actual, expected, size) != 0) {
                 sx_test_fail(__FILE__, __LINE__, "%s to_lane_order differs: count %u",
                              sx_simd_level_name(levels[l]), count);
                 return;
             }
         }
+    }
+}
+
+/* The shared exact division: inverses, quotients, and the multiple test. */
+static void test_exact_division(void) {
+    sx_rng rng;
+    sx_rng_seed(&rng, 14);
+    for (uint32_t round = 0; round < 20000; round++) {
+        uint64_t divisor = pick_divisor(&rng, round);
+        if (divisor == 0) {
+            divisor = 1u + sx_rng_below(&rng, 1000);
+        }
+        sx_exact_divisor exact = sx_exact_divisor_make(divisor);
+        SX_CHECK_EQ_U64((divisor >> exact.shift) * exact.inverse, 1);
+        uint64_t max_quotient = UINT64_MAX / divisor;
+        uint64_t quotient = sx_rng_next(&rng);
+        if (max_quotient != UINT64_MAX) {
+            quotient %= max_quotient + 1u;
+        }
+        SX_CHECK_EQ_U64(sx_divide_exact(quotient * divisor, &exact), quotient);
+        sx_multiple_test test = sx_multiple_test_make(divisor);
+        uint64_t x = sx_rng_below(&rng, 2) == 0 ? quotient * divisor : sx_rng_next(&rng);
+        SX_CHECK((sx_multiple_miss(x, &test) == 0) == (x % divisor == 0));
     }
 }
 
@@ -715,8 +749,9 @@ static const sx_test_case cases[] = {
     {"first_non_multiple_matches_scalar", test_first_non_multiple_matches_scalar},
     {"divide_exact_matches_scalar", test_divide_exact_matches_scalar},
     {"width_counts_match_scalar", test_width_counts_match_scalar},
-    {"split_exceptions_matches_scalar", test_split_exceptions_matches_scalar},
+    {"find_exceptions_matches_scalar", test_find_exceptions_matches_scalar},
     {"to_lane_order_matches_scalar", test_to_lane_order_matches_scalar},
+    {"exact_division", test_exact_division},
     {"decoders_agree_on_random_payloads", test_decoders_agree_on_random_payloads},
     {"decoders_agree_on_corrupted_chunks", test_decoders_agree_on_corrupted_chunks},
 };

@@ -13,5 +13,5 @@ void sx_bitunpack_u64(const uint8_t* in, uint32_t count, uint32_t width, uint64_
 }
 
 void sx_bitpack_to_lane_order(const uint64_t* values, uint32_t count, uint64_t* out) {
-    sx_codec_kernels_active()->to_lane_order(values, count, out);
+    sx_codec_kernels_active()->to_lane_order(values, count, UINT64_MAX, out);
 }

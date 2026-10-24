@@ -578,61 +578,83 @@ static inline __m256i merged_widths(const uint64_t* numbers) {
 
 /*
  * Blocks of 32 numbers are merged (merged_widths), and then the bytes of all blocks are
- * counted for each width. Wider numbers and the last few numbers are counted one by one.
+ * counted for each width, from max_width down. The last few numbers, and all of them if
+ * some may be wider than 52 bits, are counted one by one.
  */
-static void width_counts_avx2(const uint64_t* numbers, uint32_t count, uint32_t max_width,
-                              uint32_t* counts) {
-    memset(counts, 0, ((size_t)max_width + 1u) * sizeof(uint32_t));
+static uint32_t width_counts_avx2(const uint64_t* numbers, uint32_t count, uint32_t max_width,
+                                  uint32_t enough, uint32_t* counts) {
+    if (max_width > 52u) {
+        memset(counts, 0, ((size_t)max_width + 1u) * sizeof(uint32_t));
+        sx_add_width_counts(numbers, count, max_width, counts);
+        return sx_width_counts_stop(counts, max_width, enough);
+    }
+    __m256i blocks[SX_VECTOR_SIZE / 32u];
     uint32_t block_count = 0;
-    if (max_width <= 52u) {
-        __m256i blocks[SX_VECTOR_SIZE / 32u];
-        for (; (block_count + 1u) * 32u <= count; block_count++) {
-            blocks[block_count] = merged_widths(numbers + block_count * 32u);
+    for (; (block_count + 1u) * 32u <= count; block_count++) {
+        blocks[block_count] = merged_widths(numbers + block_count * 32u);
+    }
+    uint32_t rest[65] = {0};
+    uint32_t counted = block_count * 32u;
+    sx_add_width_counts(numbers + counted, count - counted, max_width, rest);
+
+    uint32_t at_least = 0;
+    for (uint32_t width = max_width; width > 0; width--) {
+        __m256i target = _mm256_set1_epi8((char)width);
+        uint32_t total = rest[width];
+        for (uint32_t b = 0; b < block_count; b++) {
+            __m256i same = _mm256_cmpeq_epi8(blocks[b], target);
+            total += sx_popcount_u64((uint32_t)_mm256_movemask_epi8(same));
         }
-        __m256i target = _mm256_setzero_si256();
-        __m256i one = _mm256_set1_epi8(1);
-        for (uint32_t width = 0; width <= max_width; width++) {
-            uint32_t total = 0;
-            for (uint32_t b = 0; b < block_count; b++) {
-                __m256i same = _mm256_cmpeq_epi8(blocks[b], target);
-                total += sx_popcount_u64((uint32_t)_mm256_movemask_epi8(same));
-            }
-            counts[width] = total;
-            target = _mm256_add_epi8(target, one);
+        counts[width] = total;
+        at_least += total;
+        if (at_least >= enough) {
+            return width;
         }
     }
-    uint32_t counted = block_count * 32u;
-    sx_add_width_counts(numbers + counted, count - counted, max_width, counts);
+    counts[0] = count - at_least;
+    return 0;
 }
 
-static uint32_t split_exceptions_avx2(const uint64_t* offsets, uint32_t count, uint64_t limit,
-                                      uint64_t* packed, uint16_t* positions, uint64_t* exceptions) {
+/*
+ * Each word of 64 exception bits is built from the comparison masks of 16 vectors in a
+ * register; the last few offsets are compared one by one.
+ */
+static uint32_t find_exceptions_avx2(const uint64_t* offsets, uint32_t count, uint64_t limit,
+                                     uint64_t* bits) {
     __m256i sign = _mm256_set1_epi64x(INT64_MIN);
     __m256i limit_vector = _mm256_set1_epi64x((long long)(limit ^ (uint64_t)INT64_MIN));
-    uint32_t exception_count = 0;
-    uint32_t i = 0;
-    for (; i + VECTOR_LANES <= count; i += VECTOR_LANES) {
-        __m256i x = load(offsets + i);
-        __m256i wide = _mm256_cmpgt_epi64(_mm256_xor_si256(x, sign), limit_vector);
-        store(packed + i, _mm256_andnot_si256(wide, x));
-        uint32_t bits = (uint32_t)_mm256_movemask_pd(_mm256_castsi256_pd(wide));
-        for (; bits != 0; bits &= bits - 1u) {
-            uint32_t index = i + sx_trailing_zeros_u64(bits);
-            positions[exception_count] = (uint16_t)index;
-            exceptions[exception_count] = offsets[index];
-            exception_count++;
+    uint32_t exceptions = 0;
+    for (uint32_t word = 0; word * 64u < count; word++) {
+        uint32_t begin = word * 64u;
+        uint32_t end = count - begin < 64u ? count : begin + 64u;
+        uint64_t word_bits = 0;
+        uint32_t i = begin;
+        for (; i + VECTOR_LANES <= end; i += VECTOR_LANES) {
+            __m256i x = _mm256_xor_si256(load(offsets + i), sign);
+            __m256i wide = _mm256_cmpgt_epi64(x, limit_vector);
+            uint64_t lanes = (uint32_t)_mm256_movemask_pd(_mm256_castsi256_pd(wide));
+            word_bits |= lanes << (i - begin);
         }
+        if (i < end) {
+            word_bits |= sx_exception_word(offsets, i, end, limit) << (i - begin);
+        }
+        bits[word] = word_bits;
+        exceptions += sx_popcount_u64(word_bits);
     }
-    return sx_split_exceptions_from(offsets, i, count, limit, packed, positions, exceptions,
-                                    exception_count);
+    return exceptions;
 }
 
 /*
  * Each 4x4 block of the output (four rows of four lanes) comes from four runs of four
  * values, one per lane, and is transposed from them. Blocks of full lanes are loaded
- * directly; at the end of the lanes, missing values are loaded as zeros.
+ * directly; at the end of the lanes, missing values are loaded as zeros. Values above the
+ * limit are cleared as they are loaded, unless there is no limit.
  */
-static void to_lane_order_avx2(const uint64_t* values, uint32_t count, uint64_t* out) {
+static void to_lane_order_avx2(const uint64_t* values, uint32_t count, uint64_t limit,
+                               uint64_t* out) {
+    __m256i sign = _mm256_set1_epi64x(INT64_MIN);
+    __m256i limit_vector = _mm256_set1_epi64x((long long)(limit ^ (uint64_t)INT64_MIN));
+    bool clear = limit != UINT64_MAX;
     uint32_t rows = sx_bitpack_rows(count);
     __m256i lane_index = _mm256_setr_epi64x(0, 1, 2, 3);
     for (uint32_t first_lane = 0; first_lane < SX_BITPACK_LANES; first_lane += VECTOR_LANES) {
@@ -643,19 +665,23 @@ static void to_lane_order_avx2(const uint64_t* values, uint32_t count, uint64_t*
             for (uint32_t j = 0; j < 4u; j++) {
                 /* Values of lane first_lane + j in rows [row, row + 4). */
                 uint32_t start = (first_lane + j) * rows + row;
+                __m256i v = _mm256_setzero_si256();
                 if (full) {
-                    block[j] = load(values + start);
-                    continue;
-                }
-                uint32_t in_lane = rows - row < 4u ? rows - row : 4u;
-                uint32_t available = start < count ? count - start : 0;
-                uint32_t present = available < in_lane ? available : in_lane;
-                if (present == 0) {
-                    block[j] = _mm256_setzero_si256();
+                    v = load(values + start);
                 } else {
-                    __m256i mask = _mm256_cmpgt_epi64(_mm256_set1_epi64x(present), lane_index);
-                    block[j] = _mm256_maskload_epi64((const long long*)(values + start), mask);
+                    uint32_t in_lane = rows - row < 4u ? rows - row : 4u;
+                    uint32_t available = start < count ? count - start : 0;
+                    uint32_t present = available < in_lane ? available : in_lane;
+                    if (present > 0) {
+                        __m256i mask = _mm256_cmpgt_epi64(_mm256_set1_epi64x(present), lane_index);
+                        v = _mm256_maskload_epi64((const long long*)(values + start), mask);
+                    }
                 }
+                if (clear) {
+                    __m256i wide = _mm256_cmpgt_epi64(_mm256_xor_si256(v, sign), limit_vector);
+                    v = _mm256_andnot_si256(wide, v);
+                }
+                block[j] = v;
             }
             transpose_4x4(block);
             for (uint32_t j = 0; j < 4u && row + j < rows; j++) {
@@ -677,7 +703,7 @@ const sx_codec_kernels sx_kernels_avx2 = {
     .first_non_multiple = first_non_multiple_avx2,
     .divide_exact = divide_exact_avx2,
     .width_counts = width_counts_avx2,
-    .split_exceptions = split_exceptions_avx2,
+    .find_exceptions = find_exceptions_avx2,
     .to_lane_order = to_lane_order_avx2,
 };
 
