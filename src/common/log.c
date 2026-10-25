@@ -281,7 +281,8 @@ static void enforce_retention(log_files* files) {
     struct dirent* entry = NULL;
     while ((entry = readdir(dir)) != NULL) {
         rotated_file candidate;
-        if (strlen(entry->d_name) >= sizeof(candidate.entry_name) ||
+        size_t entry_length = strlen(entry->d_name);
+        if (entry_length >= sizeof(candidate.entry_name) ||
             !parse_rotated_name(entry->d_name, files->name, &candidate)) {
             continue;
         }
@@ -300,7 +301,11 @@ static void enforce_retention(log_files* files) {
             rotated = grown;
             capacity = new_capacity;
         }
-        snprintf(candidate.entry_name, sizeof(candidate.entry_name), "%s", entry->d_name);
+        /*
+         * The length was checked above. Copying it directly, rather than with snprintf from
+         * the larger d_name array, keeps GCC from reporting a truncation that cannot happen.
+         */
+        memcpy(candidate.entry_name, entry->d_name, entry_length + 1);
         candidate.size = (uint64_t)info.st_size;
         rotated[count] = candidate;
         count++;
