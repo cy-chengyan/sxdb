@@ -123,7 +123,7 @@ static void rebuild_deltas_scalar(const uint64_t* scratch, uint32_t slot_count, 
         }
     }
     if (slot_count == SX_BITPACK_LANES * rows) {
-        out[SX_BITPACK_LANES * rows] = end;
+        out[(size_t)SX_BITPACK_LANES * rows] = end;
     }
 }
 

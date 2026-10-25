@@ -33,7 +33,7 @@ Useful options:
 | `-DSXDB_SANITIZE=address,undefined` | Build with AddressSanitizer and UndefinedBehaviorSanitizer (use with `-DCMAKE_BUILD_TYPE=Debug`) |
 | `-DSXDB_SANITIZE=thread` | Build with ThreadSanitizer |
 | `-DSXDB_WERROR=ON` | Treat compiler warnings as errors (always on in CI) |
-| `-DSXDB_SIMD=OFF` | Build only the portable codec kernels, without the AVX2, AVX-512, and NEON ones (by default the best set the CPU supports is chosen at run time) |
+| `-DSXDB_SIMD=OFF` | Build only the portable codec kernels, without the AVX2 (x86-64-v3), AVX-512 (x86-64-v4), and NEON ones (by default the best set the CPU supports is chosen at run time) |
 
 `scripts/check-source.sh` checks the source rules (ASCII only, banned functions, license headers, layering). Formatting follows `.clang-format` and is checked in CI with clang-format 22.1.8; other releases format some constructs differently, so use the same version (`pipx install clang-format==22.1.8`).
 

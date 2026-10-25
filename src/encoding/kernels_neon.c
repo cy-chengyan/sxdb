@@ -311,7 +311,7 @@ static void rebuild_deltas_neon(const uint64_t* scratch, uint32_t slot_count, ui
             vst1q_u64(dst, vzip1q_u64(row0, row1));
             vst1q_u64(dst + rows, vzip2q_u64(row0, row1));
         }
-        src += 2u * SX_BITPACK_LANES;
+        src += (size_t)2u * SX_BITPACK_LANES;
     }
     if (j < rows) {
         for (uint32_t q = 0; q < VECTORS_PER_ROW; q++) {
@@ -322,7 +322,7 @@ static void rebuild_deltas_neon(const uint64_t* scratch, uint32_t slot_count, ui
         }
     }
     if (slot_count == SX_BITPACK_LANES * rows) {
-        out[SX_BITPACK_LANES * rows] = end;
+        out[(size_t)SX_BITPACK_LANES * rows] = end;
     }
 }
 

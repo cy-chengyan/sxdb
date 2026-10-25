@@ -213,7 +213,8 @@ static void decode_for_avx2(const uint8_t* packed, uint32_t count, uint32_t widt
 static void decode_alp_avx2(const uint8_t* packed, uint32_t count, uint32_t width, uint64_t base,
                             const sx_alp_scales* scales, double* out) {
     __m256i mask = _mm256_set1_epi64x((long long)sx_low_mask_u64(width));
-    __m256i shifted_base = _mm256_set1_epi64x((long long)(base + SX_ALP_MAGIC_BITS));
+    uint64_t magic_base = base + SX_ALP_MAGIC_BITS;
+    __m256i shifted_base = _mm256_set1_epi64x((long long)magic_base);
     __m256d magic = _mm256_set1_pd(SX_ALP_MAGIC);
     __m256d factor = _mm256_set1_pd(scales->decode_factor);
     __m256d exponent = _mm256_set1_pd(scales->decode_exponent);
@@ -336,7 +337,7 @@ static void rebuild_deltas_avx2(const uint64_t* scratch, uint32_t slot_count, ui
         }
     }
     if (slot_count == SX_BITPACK_LANES * rows) {
-        out[SX_BITPACK_LANES * rows] = end;
+        out[(size_t)SX_BITPACK_LANES * rows] = end;
     }
 }
 
@@ -623,7 +624,8 @@ static inline __m256i merged_widths(const uint64_t* numbers) {
         __m256i exponent = _mm256_srli_epi64(_mm256_castpd_si256(exact), 52);
         /* Zero gives -1022; a 32-bit maximum with 0 clears both halves of it. */
         __m256i width = _mm256_max_epi32(_mm256_sub_epi64(exponent, exponent_bias), zero);
-        widths = _mm256_or_si256(widths, _mm256_sllv_epi64(width, _mm256_set1_epi64x(8 * k)));
+        __m256i shift = _mm256_set1_epi64x((long long)k * 8);
+        widths = _mm256_or_si256(widths, _mm256_sllv_epi64(width, shift));
     }
     return widths;
 }
@@ -643,7 +645,7 @@ static uint32_t width_counts_avx2(const uint64_t* numbers, uint32_t count, uint3
     __m256i blocks[SX_VECTOR_SIZE / 32u];
     uint32_t block_count = 0;
     for (; (block_count + 1u) * 32u <= count; block_count++) {
-        blocks[block_count] = merged_widths(numbers + block_count * 32u);
+        blocks[block_count] = merged_widths(numbers + (size_t)block_count * 32u);
     }
     uint32_t rest[65] = {0};
     uint32_t counted = block_count * 32u;

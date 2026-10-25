@@ -180,7 +180,8 @@ static void decode_for_avx512(const uint8_t* packed, uint32_t count, uint32_t wi
 static void decode_alp_avx512(const uint8_t* packed, uint32_t count, uint32_t width, uint64_t base,
                               const sx_alp_scales* scales, double* out) {
     __m512i mask = _mm512_set1_epi64((long long)sx_low_mask_u64(width));
-    __m512i shifted_base = _mm512_set1_epi64((long long)(base + SX_ALP_MAGIC_BITS));
+    uint64_t magic_base = base + SX_ALP_MAGIC_BITS;
+    __m512i shifted_base = _mm512_set1_epi64((long long)magic_base);
     __m512d magic = _mm512_set1_pd(SX_ALP_MAGIC);
     __m512d factor = _mm512_set1_pd(scales->decode_factor);
     __m512d exponent = _mm512_set1_pd(scales->decode_exponent);
@@ -313,7 +314,7 @@ static void rebuild_deltas_avx512(const uint64_t* scratch, uint32_t slot_count, 
         }
     }
     if (slot_count == SX_BITPACK_LANES * rows) {
-        out[SX_BITPACK_LANES * rows] = end;
+        out[(size_t)SX_BITPACK_LANES * rows] = end;
     }
 }
 
@@ -533,7 +534,7 @@ static inline __m512i merged_leading_zeros(const uint64_t* numbers, uint32_t pre
         } else if (present > first) {
             x = _mm512_maskz_loadu_epi64(first_lanes(present - first), numbers + first);
         }
-        __m512i shift = _mm512_set1_epi64(8 * k);
+        __m512i shift = _mm512_set1_epi64((long long)k * 8);
         zeros = _mm512_or_si512(zeros, _mm512_sllv_epi64(_mm512_lzcnt_epi64(x), shift));
     }
     return zeros;
