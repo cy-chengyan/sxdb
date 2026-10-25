@@ -455,8 +455,11 @@ static void summarize_ints_neon(const int64_t* values, uint32_t count, uint64_t*
     for (; i + VECTOR_LANES <= count; i += VECTOR_LANES) {
         int64x2_t v = vld1q_s64(values + i);
         int64x2_t previous = vld1q_s64(values + i - 1);
-        int64x2_t delta = vsubq_s64(v, previous);
-        vst1q_u64(deltas + i - 1, vreinterpretq_u64_s64(delta));
+        /* Unsigned, so that it wraps: GCC's vsubq_s64 is a signed subtraction in C. */
+        uint64x2_t difference =
+            vsubq_u64(vreinterpretq_u64_s64(v), vreinterpretq_u64_s64(previous));
+        int64x2_t delta = vreinterpretq_s64_u64(difference);
+        vst1q_u64(deltas + i - 1, difference);
         min = min_i64x2(min, v);
         max = max_i64x2(max, v);
         delta_min = min_i64x2(delta_min, delta);
