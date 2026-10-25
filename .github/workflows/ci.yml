@@ -42,6 +42,9 @@ jobs:
           - { os: ubuntu-24.04, cc: gcc, variant: c23 }
           - { os: ubuntu-24.04, cc: gcc, variant: simd-off }
           - { os: ubuntu-24.04, cc: clang, variant: asan-ubsan }
+          # GCC's arm_neon.h writes some intrinsics as plain C arithmetic, so UBSan sees
+          # signed overflow in them only with GCC.
+          - { os: ubuntu-24.04-arm, cc: gcc, variant: asan-ubsan }
           - { os: ubuntu-24.04, cc: clang, variant: tsan }
           - { os: macos-15, cc: clang, variant: release }
           - { os: macos-15-intel, cc: clang, variant: release }
