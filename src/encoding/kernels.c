@@ -12,6 +12,7 @@
 #include "os/os.h"
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <string.h>
 
 static const char* const level_names[SX_SIMD_LEVEL_COUNT] = {
@@ -60,7 +61,12 @@ static bool cpu_supports(sx_simd_level level) {
     return false;
 }
 
-static const sx_codec_kernels* active_kernels;
+/*
+ * The set in use. Codecs ask for it once per chunk, so after the first choice it is read
+ * with a single load rather than through pthread_once, which costs a call and a
+ * synchronizing check every time.
+ */
+static _Atomic(const sx_codec_kernels*) active_kernels;
 static pthread_once_t select_once = PTHREAD_ONCE_INIT;
 
 static void select_best(void) {
@@ -72,15 +78,20 @@ static void select_best(void) {
     };
     for (size_t i = 0; i < SX_ARRAY_SIZE(preference); i++) {
         if (sx_simd_level_supported(preference[i])) {
-            active_kernels = compiled_kernels(preference[i]);
+            atomic_store_explicit(&active_kernels, compiled_kernels(preference[i]),
+                                  memory_order_release);
             return;
         }
     }
 }
 
 const sx_codec_kernels* sx_codec_kernels_active(void) {
+    const sx_codec_kernels* kernels = atomic_load_explicit(&active_kernels, memory_order_acquire);
+    if (SX_LIKELY(kernels != NULL)) {
+        return kernels;
+    }
     pthread_once(&select_once, select_best);
-    return active_kernels;
+    return atomic_load_explicit(&active_kernels, memory_order_acquire);
 }
 
 bool sx_simd_level_supported(sx_simd_level level) {
@@ -96,7 +107,7 @@ bool sx_simd_set_level(sx_simd_level level) {
     }
     /* Run the default choice first, so that it cannot overwrite this one later. */
     pthread_once(&select_once, select_best);
-    active_kernels = compiled_kernels(level);
+    atomic_store_explicit(&active_kernels, compiled_kernels(level), memory_order_release);
     return true;
 }
 
