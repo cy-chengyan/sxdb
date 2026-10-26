@@ -14,12 +14,20 @@
 #define SAMPLE_SIZE 32u
 _Static_assert(SAMPLE_SIZE <= SX_ALP_TRIAL_MAX_VALUES, "try_alp_pairs takes the whole sample");
 
-/* A full parameter search is repeated at least this often (in chunks)... */
-#define ALP_SEARCH_INTERVAL 64u
-
-/* ...and immediately when the remembered parameters produce this many more sample
- * exceptions than the last full search found. */
+/*
+ * When the full parameter search is repeated:
+ * - at least every ALP_SEARCH_INTERVAL values (64 chunks of SX_VECTOR_SIZE), counted in
+ *   values so that small chunks do not search more often per value;
+ * - immediately when the remembered pairs produce ALP_CHANGE_EXCEPTIONS more sample
+ *   exceptions than the last search found (the data has changed);
+ * - after ALP_SEARCH_CHUNKS chunks, as soon as they produce more sample exceptions than
+ *   the last search found at all. Small chunks keep the remembered pairs past the 64 chunks
+ *   only while they stay as good; each sample exception adds an estimated 2.5 bits per
+ *   value, and without this check, columns whose best pair drifts lost up to 0.2%.
+ */
+#define ALP_SEARCH_INTERVAL   65536u
 #define ALP_CHANGE_EXCEPTIONS (SAMPLE_SIZE / 8u)
+#define ALP_SEARCH_CHUNKS     64u
 
 /* ---------------------------------------------------------------------------------------- */
 /* ALP parameters                                                                           */
@@ -553,22 +561,26 @@ void sx_double_encoder_init(sx_double_encoder* encoder) {
  */
 static void choose_parameters(sx_double_encoder* encoder, const sample* sampled, uint32_t count,
                               alp_choice* alp, rd_choice* rd) {
-    if (encoder->candidate_count > 0 && encoder->chunks_until_search > 0) {
+    if (encoder->candidate_count > 0 && encoder->values_until_search > 0) {
         *alp = best_remembered_alp(encoder, sampled, count);
-        /* Clearly more exceptions than the full search saw means the data has changed. */
         bool data_changed =
             alp->sample_exceptions > encoder->search_exceptions + ALP_CHANGE_EXCEPTIONS;
-        if (!data_changed) {
+        bool drifted = encoder->chunks_since_search >= ALP_SEARCH_CHUNKS &&
+                       alp->sample_exceptions > encoder->search_exceptions;
+        if (!data_changed && !drifted) {
             *rd = estimate_rd_unless_worse(sampled, count, encoder->rd_right_width,
                                            alp->estimated_bits);
-            encoder->chunks_until_search--;
+            encoder->values_until_search -=
+                count < encoder->values_until_search ? count : encoder->values_until_search;
+            encoder->chunks_since_search++;
             return;
         }
     }
     *alp = search_alp(sampled, count, encoder);
     *rd = search_rd(sampled, count);
     encoder->rd_right_width = rd->right_width;
-    encoder->chunks_until_search = ALP_SEARCH_INTERVAL;
+    encoder->values_until_search = ALP_SEARCH_INTERVAL;
+    encoder->chunks_since_search = 0;
 }
 
 sx_err sx_double_encode(const double* values, uint32_t count, sx_byte_writer* out,

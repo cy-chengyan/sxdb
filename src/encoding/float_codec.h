@@ -52,9 +52,10 @@
  * Choosing ALP parameters means trying all 190 exponent/factor pairs on a sample, which
  * dominates the encoding time of small chunks. Successive chunks of a column almost
  * always want the same few pairs, so the encoder remembers the best ones and tries only
- * those. It repeats the full search every 64 chunks, and immediately when the remembered
- * pairs produce clearly more exceptions than before (the data changed). The state only
- * affects how long parameter choice takes and never the correctness of the output.
+ * those. It repeats the full search every 65536 values, immediately when the remembered
+ * pairs produce clearly more exceptions than before (the data changed), and, once 64
+ * chunks have passed, as soon as they produce any more. The state only affects how long
+ * parameter choice takes and never the correctness of the output.
  */
 typedef struct sx_double_encoder {
     uint8_t exponents[SX_ALP_CANDIDATES];
@@ -62,7 +63,8 @@ typedef struct sx_double_encoder {
     uint32_t candidate_count;
     uint32_t search_exceptions;   /* sample exceptions of the best pair at the last search */
     uint32_t rd_right_width;      /* best ALP_RD split position at the last search */
-    uint32_t chunks_until_search; /* chunks left before the next full search */
+    uint32_t values_until_search; /* values left before the next full search */
+    uint32_t chunks_since_search; /* chunks encoded with the remembered pairs since then */
 } sx_double_encoder;
 
 /* Largest payload any chosen encoding can produce for `count` values. */

@@ -222,7 +222,7 @@ All encodings are lightweight and SIMD-decodable. Following the performance-firs
 | 11 | DELTA_PATCHED | Timestamps with a few large gaps (lunch breaks, nights, weekends) and other mostly regular sequences: regular steps are packed narrowly and the few large ones are stored apart as exceptions |
 
 - When writing a chunk, the applicable encodings are compared and the smallest result wins. Integer encodings are sized exactly from one pass of statistics; floating-point encodings are estimated from a sample.
-- ALP parameter choice is carried across the chunks of a column: the encoder remembers the best exponent/factor pairs, repeats the full search every 64 chunks or when the remembered pairs start producing exceptions, and always also tries fewer decimal places. This keeps encoding fast on small chunks without losing compression.
+- ALP parameter choice is carried across the chunks of a column: the encoder remembers the best exponent/factor pairs, repeats the full search every 65536 values (64 full chunks; counted in values so that small chunks do not search more often per value, and small chunks past 64 chunks only while the remembered pairs produce no more exceptions than at the search) or when the remembered pairs start producing exceptions, and always also tries fewer decimal places. This keeps encoding fast on small chunks without losing compression.
 - Bit-packing uses a FastLanes-style interleaved layout of 1024 values, so even scalar code auto-vectorizes.
 - Cold partitions can add a ZSTD layer, enabled with the table option `cold_compression = 'zstd'` (off by default).
 - The byte layout of each encoding's payload is documented in its codec header (`src/encoding/*_codec.h`).
