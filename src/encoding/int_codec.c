@@ -485,19 +485,15 @@ static bool decode_raw(sx_byte_reader* in, uint32_t count, int64_t* out) {
 }
 
 static bool decode_constant(sx_byte_reader* in, uint32_t count, int64_t* out) {
-    int64_t value = sx_reader_get_i64(in);
-    for (uint32_t i = 0; i < count; i++) {
-        out[i] = value;
-    }
+    uint64_t value = sx_reader_get_u64(in);
+    sx_codec_kernels_active()->fill_arithmetic(out, count, value, 0);
     return true;
 }
 
 static bool decode_delta_const(sx_byte_reader* in, uint32_t count, int64_t* out) {
     uint64_t first = sx_reader_get_u64(in);
     uint64_t step = sx_reader_get_u64(in);
-    for (uint32_t i = 0; i < count; i++) {
-        out[i] = (int64_t)(first + (uint64_t)i * step);
-    }
+    sx_codec_kernels_active()->fill_arithmetic(out, count, first, step);
     return true;
 }
 

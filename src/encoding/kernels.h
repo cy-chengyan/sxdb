@@ -133,6 +133,14 @@ typedef struct sx_codec_kernels {
                            const uint64_t* lane_totals, uint64_t* out);
 
     /*
+     * Writes the `count` (0 to SX_VECTOR_SIZE) 64-bit words first, first + step,
+     * first + 2 * step, ... to `out`, wrapping modulo 2^64; a step of 0 repeats `first`.
+     * Decodes CONSTANT and DELTA_CONST. `out` may hold int64_t, uint64_t, or double
+     * values: the words are their bit patterns. Writes exactly `count` words.
+     */
+    void (*fill_arithmetic)(void* out, uint32_t count, uint64_t first, uint64_t step);
+
+    /*
      * ALP encoding of `count` values with one exponent/factor pair (sx_alp_encode_value).
      * Sets bit i of `exception_bits` (ceil(count / 64) words, unused bits cleared) for
      * every value that does not round-trip. digits[i] is set for every other value and

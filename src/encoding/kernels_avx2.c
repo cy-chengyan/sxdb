@@ -341,6 +341,38 @@ static void rebuild_deltas_avx2(const uint64_t* scratch, uint32_t slot_count, ui
     }
 }
 
+/*
+ * Four vectors per iteration, each step * 4 above the one before, as in the AVX-512
+ * version. The last words are stored under a mask.
+ */
+static void fill_arithmetic_avx2(void* out, uint32_t count, uint64_t first, uint64_t step) {
+    uint64_t* dst = out;
+    uint64_t start[VECTOR_LANES];
+    for (uint32_t k = 0; k < VECTOR_LANES; k++) {
+        start[k] = first + k * step;
+    }
+    __m256i value = load(start);
+    __m256i step1 = _mm256_set1_epi64x((long long)(step * VECTOR_LANES));
+    __m256i step2 = _mm256_add_epi64(step1, step1);
+    __m256i step3 = _mm256_add_epi64(step2, step1);
+    __m256i step4 = _mm256_add_epi64(step2, step2);
+    uint32_t i = 0;
+    for (; i + 4u * VECTOR_LANES <= count; i += 4u * VECTOR_LANES) {
+        store(dst + i, value);
+        store(dst + i + VECTOR_LANES, _mm256_add_epi64(value, step1));
+        store(dst + i + 2u * VECTOR_LANES, _mm256_add_epi64(value, step2));
+        store(dst + i + 3u * VECTOR_LANES, _mm256_add_epi64(value, step3));
+        value = _mm256_add_epi64(value, step4);
+    }
+    for (; i < count; i += VECTOR_LANES) {
+        /* All ones in the lanes below count - i. */
+        __m256i mask = _mm256_cmpgt_epi64(_mm256_set1_epi64x((long long)(count - i)),
+                                          _mm256_setr_epi64x(0, 1, 2, 3));
+        _mm256_maskstore_epi64((long long*)(dst + i), mask, value);
+        value = _mm256_add_epi64(value, step1);
+    }
+}
+
 /* Lane-wise minimum and maximum of 64-bit integers (AVX2 has no instruction for them). */
 static inline __m256i min_i64x4(__m256i a, __m256i b) {
     return _mm256_blendv_epi8(a, b, _mm256_cmpgt_epi64(a, b));
@@ -753,6 +785,7 @@ const sx_codec_kernels sx_kernels_avx2 = {
     .decode_alp = decode_alp_avx2,
     .decode_deltas = decode_deltas_avx2,
     .rebuild_deltas = rebuild_deltas_avx2,
+    .fill_arithmetic = fill_arithmetic_avx2,
     .encode_alp = encode_alp_avx2,
     .summarize_ints = summarize_ints_avx2,
     .first_non_multiple = first_non_multiple_avx2,

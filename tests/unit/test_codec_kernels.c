@@ -422,6 +422,51 @@ static void test_rebuild_deltas_matches_scalar(void) {
     }
 }
 
+/* Every count from 0 to SX_VECTOR_SIZE, with steps of 0, 1, -1, and random ones. */
+static void test_fill_arithmetic_matches_scalar(void) {
+    const sx_codec_kernels* scalar = level_kernels(SX_SIMD_SCALAR);
+    sx_simd_level levels[SX_SIMD_LEVEL_COUNT];
+    uint32_t level_count = simd_levels(levels);
+    sx_rng rng;
+    sx_rng_seed(&rng, 13);
+    uint64_t expected[SX_VECTOR_SIZE + 16];
+    uint64_t actual[SX_VECTOR_SIZE + 16];
+    for (uint32_t count = 0; count <= SX_VECTOR_SIZE; count++) {
+        uint64_t first = sx_rng_next(&rng);
+        uint64_t steps[] = {0, 1, UINT64_MAX, sx_rng_next(&rng)};
+        uint64_t step = steps[count % SX_ARRAY_SIZE(steps)];
+        memset(expected, 0x5A, sizeof(expected));
+        scalar->fill_arithmetic(expected, count, first, step);
+        for (uint32_t i = 0; i < count; i++) {
+            if (expected[i] != first + i * step) {
+                sx_test_fail(__FILE__, __LINE__, "scalar fill_arithmetic word %u wrong: count %u",
+                             i, count);
+                return;
+            }
+        }
+        for (size_t i = count; i < SX_ARRAY_SIZE(expected); i++) {
+            SX_CHECK_EQ_U64(expected[i], UINT64_C(0x5A5A5A5A5A5A5A5A));
+        }
+
+        for (uint32_t l = 0; l < level_count; l++) {
+            memset(actual, 0xA5, sizeof(actual));
+            level_kernels(levels[l])->fill_arithmetic(actual, count, first, step);
+            if (memcmp(actual, expected, (size_t)count * sizeof(uint64_t)) != 0) {
+                sx_test_fail(__FILE__, __LINE__, "%s fill_arithmetic differs: count %u",
+                             sx_simd_level_name(levels[l]), count);
+                return;
+            }
+            for (size_t i = count; i < SX_ARRAY_SIZE(actual); i++) {
+                if (actual[i] != UINT64_C(0xA5A5A5A5A5A5A5A5)) {
+                    sx_test_fail(__FILE__, __LINE__, "%s fill_arithmetic wrote word %zu of %u",
+                                 sx_simd_level_name(levels[l]), i, count);
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /* Doubles of one kind: decimals with a few digits, special values, or random bits. */
 static double random_double(sx_rng* rng, uint32_t kind) {
     switch (kind % 4u) {
@@ -925,6 +970,7 @@ static const sx_test_case cases[] = {
     {"decode_deltas_matches_scalar", test_decode_deltas_matches_scalar},
     {"every_row_count_matches_scalar", test_every_row_count_matches_scalar},
     {"rebuild_deltas_matches_scalar", test_rebuild_deltas_matches_scalar},
+    {"fill_arithmetic_matches_scalar", test_fill_arithmetic_matches_scalar},
     {"encode_alp_matches_scalar", test_encode_alp_matches_scalar},
     {"summarize_ints_matches_scalar", test_summarize_ints_matches_scalar},
     {"first_non_multiple_matches_scalar", test_first_non_multiple_matches_scalar},

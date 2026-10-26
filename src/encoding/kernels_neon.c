@@ -326,6 +326,35 @@ static void rebuild_deltas_neon(const uint64_t* scratch, uint32_t slot_count, ui
     }
 }
 
+/*
+ * Four vectors per iteration, each step * 2 above the one before, as in the AVX-512
+ * version; then pairs, and a last single word.
+ */
+static void fill_arithmetic_neon(void* out, uint32_t count, uint64_t first, uint64_t step) {
+    uint8_t* dst = out;
+    uint64_t start[VECTOR_LANES] = {first, first + step};
+    uint64x2_t value = vld1q_u64(start);
+    uint64x2_t step1 = vdupq_n_u64(step * VECTOR_LANES);
+    uint64x2_t step2 = vaddq_u64(step1, step1);
+    uint64x2_t step3 = vaddq_u64(step2, step1);
+    uint64x2_t step4 = vaddq_u64(step2, step2);
+    uint32_t i = 0;
+    for (; i + 4u * VECTOR_LANES <= count; i += 4u * VECTOR_LANES) {
+        store_bytes(dst + (size_t)i * sizeof(uint64_t), value);
+        store_bytes(dst + (i + VECTOR_LANES) * sizeof(uint64_t), vaddq_u64(value, step1));
+        store_bytes(dst + (i + 2u * VECTOR_LANES) * sizeof(uint64_t), vaddq_u64(value, step2));
+        store_bytes(dst + (i + 3u * VECTOR_LANES) * sizeof(uint64_t), vaddq_u64(value, step3));
+        value = vaddq_u64(value, step4);
+    }
+    for (; i + VECTOR_LANES <= count; i += VECTOR_LANES) {
+        store_bytes(dst + (size_t)i * sizeof(uint64_t), value);
+        value = vaddq_u64(value, step1);
+    }
+    if (i < count) {
+        sx_store_u64(dst + (size_t)i * sizeof(uint64_t), vgetq_lane_u64(value, 0));
+    }
+}
+
 typedef struct alp_constants {
     float64x2_t encode_exponent;
     float64x2_t encode_factor;
@@ -633,6 +662,7 @@ const sx_codec_kernels sx_kernels_neon = {
     .decode_alp = decode_alp_neon,
     .decode_deltas = decode_deltas_neon,
     .rebuild_deltas = rebuild_deltas_neon,
+    .fill_arithmetic = fill_arithmetic_neon,
     .encode_alp = encode_alp_neon,
     .summarize_ints = summarize_ints_neon,
     .first_non_multiple = first_non_multiple_neon,

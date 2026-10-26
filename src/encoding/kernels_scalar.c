@@ -127,6 +127,15 @@ static void rebuild_deltas_scalar(const uint64_t* scratch, uint32_t slot_count, 
     }
 }
 
+static void fill_arithmetic_scalar(void* out, uint32_t count, uint64_t first, uint64_t step) {
+    uint8_t* dst = out;
+    uint64_t value = first;
+    for (uint32_t i = 0; i < count; i++) {
+        sx_store_u64(dst + (size_t)i * sizeof(uint64_t), value);
+        value += step;
+    }
+}
+
 static uint32_t encode_alp_scalar(const double* values, uint32_t count, const sx_alp_scales* scales,
                                   int64_t* digits, uint64_t* exception_bits,
                                   sx_alp_digit_range* range) {
@@ -239,6 +248,7 @@ const sx_codec_kernels sx_kernels_scalar = {
     .decode_alp = decode_alp_scalar,
     .decode_deltas = decode_deltas_scalar,
     .rebuild_deltas = rebuild_deltas_scalar,
+    .fill_arithmetic = fill_arithmetic_scalar,
     .encode_alp = encode_alp_scalar,
     .summarize_ints = summarize_ints_scalar,
     .first_non_multiple = first_non_multiple_scalar,

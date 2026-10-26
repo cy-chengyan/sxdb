@@ -498,6 +498,42 @@ static void rebuild_deltas_avx512(const uint64_t* scratch, uint32_t slot_count, 
     }
 }
 
+/* Lanes of a vector that hold one of the `remaining` values from its start. */
+static inline __mmask8 first_lanes(uint32_t remaining) {
+    return remaining >= VECTOR_LANES ? (__mmask8)0xff : (__mmask8)((1u << remaining) - 1u);
+}
+
+/*
+ * Four vectors per iteration, each step * 8 above the one before: a loop that stores one
+ * or two words per iteration is limited by fetching its few instructions, at a speed that
+ * depends on where the linker puts it (see DESIGN 4.2). The last words are stored under
+ * a mask.
+ */
+static void fill_arithmetic_avx512(void* out, uint32_t count, uint64_t first, uint64_t step) {
+    uint64_t* dst = out;
+    uint64_t start[VECTOR_LANES];
+    for (uint32_t k = 0; k < VECTOR_LANES; k++) {
+        start[k] = first + k * step;
+    }
+    __m512i value = _mm512_loadu_si512(start);
+    __m512i step1 = _mm512_set1_epi64((long long)(step * VECTOR_LANES));
+    __m512i step2 = _mm512_add_epi64(step1, step1);
+    __m512i step3 = _mm512_add_epi64(step2, step1);
+    __m512i step4 = _mm512_add_epi64(step2, step2);
+    uint32_t i = 0;
+    for (; i + 4u * VECTOR_LANES <= count; i += 4u * VECTOR_LANES) {
+        _mm512_storeu_si512(dst + i, value);
+        _mm512_storeu_si512(dst + i + VECTOR_LANES, _mm512_add_epi64(value, step1));
+        _mm512_storeu_si512(dst + i + 2u * VECTOR_LANES, _mm512_add_epi64(value, step2));
+        _mm512_storeu_si512(dst + i + 3u * VECTOR_LANES, _mm512_add_epi64(value, step3));
+        value = _mm512_add_epi64(value, step4);
+    }
+    for (; i < count; i += VECTOR_LANES) {
+        _mm512_mask_storeu_epi64(dst + i, first_lanes(count - i), value);
+        value = _mm512_add_epi64(value, step1);
+    }
+}
+
 /*
  * Values are encoded 64 at a time, one word of exception bits, which is built in a
  * register and stored once.
@@ -561,11 +597,6 @@ static uint32_t encode_alp_avx512(const double* values, uint32_t count, const sx
     range->min = vector_min < tail_min ? vector_min : tail_min;
     range->max = vector_max > tail_max ? vector_max : tail_max;
     return exceptions;
-}
-
-/* Lanes of a vector that hold one of the `remaining` values from its start. */
-static inline __mmask8 first_lanes(uint32_t remaining) {
-    return remaining >= VECTOR_LANES ? (__mmask8)0xff : (__mmask8)((1u << remaining) - 1u);
 }
 
 /* The running minimums and maximums of summarize_ints. */
@@ -831,6 +862,7 @@ const sx_codec_kernels sx_kernels_avx512 = {
     .decode_alp = decode_alp_avx512,
     .decode_deltas = decode_deltas_avx512,
     .rebuild_deltas = rebuild_deltas_avx512,
+    .fill_arithmetic = fill_arithmetic_avx512,
     .encode_alp = encode_alp_avx512,
     .summarize_ints = summarize_ints_avx512,
     .first_non_multiple = first_non_multiple_avx512,

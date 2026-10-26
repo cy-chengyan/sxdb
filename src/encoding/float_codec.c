@@ -620,10 +620,8 @@ static bool decode_raw(sx_byte_reader* in, uint32_t count, double* out) {
 }
 
 static bool decode_constant(sx_byte_reader* in, uint32_t count, double* out) {
-    double value = sx_reader_get_f64(in);
-    for (uint32_t i = 0; i < count; i++) {
-        out[i] = value;
-    }
+    uint64_t bits = sx_reader_get_u64(in);
+    sx_codec_kernels_active()->fill_arithmetic(out, count, bits, 0);
     return true;
 }
 
