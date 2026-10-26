@@ -47,6 +47,7 @@ typedef struct bench_csv_options {
     bool skip_header; /* ignore the first line of every file */
     bool split;       /* start a new chunk whenever field `split_field` changes */
     unsigned split_field;
+    uint32_t chunk_rows; /* most rows per chunk, 1 to SX_VECTOR_SIZE; 0 means SX_VECTOR_SIZE */
 } bench_csv_options;
 
 typedef struct bench_csv_data {

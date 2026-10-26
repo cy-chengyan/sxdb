@@ -13,14 +13,20 @@
  *   --values N        values per synthetic dataset (default 1048576)
  *   --min-time S      minimum seconds to time each measurement (default 0.25)
  *   --threads N       encode and decode with N threads (default 1)
+ *   --chunk-rows N    at most N values per chunk, 1 to 1024 (default 1024)
  *   --simd LEVEL      codec kernels: scalar, avx2, avx512, or neon (default: the best the
  *                     CPU supports)
  *
  * Synthetic datasets are cut into chunks of 1024 values. CSV input is cut the way the
  * storage engine cuts blocks: at most 1024 values, never across two files (series), and
  * with --split-on never across a change of that field (a partition such as a day).
- * The first decode pass is checked against the input, so a wrong codec cannot report a
+ * --chunk-rows lowers the 1024, as short series, fine partitions, and the tails of series
+ * do. The first decode pass is checked against the input, so a wrong codec cannot report a
  * result.
+ *
+ * Encoded chunks are stored back to back, as in the pages of a segment file, so decoding
+ * streams through them as a scan does. Besides the speeds, the report gives the encoded
+ * bytes read per second while decoding, to compare with the memory bandwidth of one core.
  */
 
 #include "chunks.h"
@@ -53,6 +59,7 @@
 
 typedef struct bench_options {
     uint32_t value_count;
+    uint32_t chunk_rows;
     double min_seconds;
     unsigned threads;
     const char* datasets[MAX_DATASETS];
@@ -63,11 +70,17 @@ typedef struct bench_options {
     bench_csv_options csv;
 } bench_options;
 
-/* Every chunk encoded into its own slot, sized for the worst case so that chunks can be
- * encoded in parallel. */
+/*
+ * The encoded chunks of a column. `data` has room for every chunk at its worst-case size,
+ * and bound_offsets[c] is where chunk c would start if every chunk before it took that
+ * much. An encoding pass over chunks [first, end) starts at bound_offsets[first] and
+ * writes them back to back (8-byte aligned), recording where each one went in offsets[],
+ * so that threads with separate ranges never overlap.
+ */
 typedef struct encoded_column {
     uint8_t* data;
-    size_t* slot_offsets;
+    size_t* bound_offsets;
+    size_t* offsets;
     size_t* sizes;
     sx_encoding* encodings;
 } encoded_column;
@@ -141,7 +154,7 @@ static sx_err encode_chunk(const bench_column* column, uint32_t start, uint32_t 
 }
 
 static sx_err decode_chunk(const bench_job* job, uint32_t chunk, decode_buffers* buffers) {
-    const uint8_t* payload = job->encoded.data + job->encoded.slot_offsets[chunk];
+    const uint8_t* payload = job->encoded.data + job->encoded.offsets[chunk];
     size_t size = job->encoded.sizes[chunk];
     sx_encoding encoding = job->encoded.encodings[chunk];
     uint32_t count = job->chunks->counts[chunk];
@@ -193,20 +206,23 @@ static bool chunk_matches(const bench_column* column, uint32_t start, uint32_t c
 /* ---------------------------------------------------------------------------------------- */
 
 static bool encode_range(bench_job* job, uint32_t first, uint32_t end) {
+    encoded_column* encoded = &job->encoded;
     sx_double_encoder double_encoder;
     sx_double_encoder_init(&double_encoder);
+    size_t offset = first < end ? encoded->bound_offsets[first] : 0;
     for (uint32_t chunk = first; chunk < end; chunk++) {
         uint32_t start = job->chunks->starts[chunk];
         uint32_t count = job->chunks->counts[chunk];
         sx_byte_writer writer;
-        sx_writer_init(&writer, job->encoded.data + job->encoded.slot_offsets[chunk],
-                       chunk_bound(job->column, start, count));
+        sx_writer_init(&writer, encoded->data + offset, chunk_bound(job->column, start, count));
         if (encode_chunk(job->column, start, count, &double_encoder, &writer,
-                         &job->encoded.encodings[chunk]) != SX_OK) {
+                         &encoded->encodings[chunk]) != SX_OK) {
             fprintf(stderr, "error: encoding chunk %u failed\n", chunk);
             return false;
         }
-        job->encoded.sizes[chunk] = writer.size;
+        encoded->offsets[chunk] = offset;
+        encoded->sizes[chunk] = writer.size;
+        offset += sx_align_up(writer.size, 8);
     }
     return true;
 }
@@ -337,10 +353,12 @@ static bool job_init(bench_job* job, const bench_column* column, const bench_chu
     job->threads = threads;
 
     encoded_column* encoded = &job->encoded;
-    encoded->slot_offsets = calloc(chunks->count, sizeof(size_t));
+    encoded->bound_offsets = calloc(chunks->count, sizeof(size_t));
+    encoded->offsets = calloc(chunks->count, sizeof(size_t));
     encoded->sizes = calloc(chunks->count, sizeof(size_t));
     encoded->encodings = calloc(chunks->count, sizeof(sx_encoding));
-    if (encoded->slot_offsets == NULL || encoded->sizes == NULL || encoded->encodings == NULL) {
+    if (encoded->bound_offsets == NULL || encoded->offsets == NULL || encoded->sizes == NULL ||
+        encoded->encodings == NULL) {
         return false;
     }
 
@@ -349,7 +367,7 @@ static bool job_init(bench_job* job, const bench_column* column, const bench_chu
     for (uint32_t chunk = 0; chunk < chunks->count; chunk++) {
         uint32_t start = chunks->starts[chunk];
         uint32_t count = chunks->counts[chunk];
-        encoded->slot_offsets[chunk] = capacity;
+        encoded->bound_offsets[chunk] = capacity;
         capacity += sx_align_up(chunk_bound(column, start, count), 8);
         if (column->type == BENCH_TYPE_STRING) {
             size_t bytes = column->offsets[start + count] - column->offsets[start];
@@ -379,7 +397,8 @@ static bool job_init(bench_job* job, const bench_column* column, const bench_chu
 
 static void job_free(bench_job* job) {
     free(job->encoded.data);
-    free(job->encoded.slot_offsets);
+    free(job->encoded.bound_offsets);
+    free(job->encoded.offsets);
     free(job->encoded.sizes);
     free(job->encoded.encodings);
     for (unsigned t = 0; t < job->threads; t++) {
@@ -434,11 +453,11 @@ static bool run_benchmark(const bench_column* column, const bench_chunks* chunks
 /* ---------------------------------------------------------------------------------------- */
 
 static void print_header(const char* first_column) {
-    printf("%-18s %-7s %10s %9s %8s %10s %10s %10s  %s\n", first_column, "type", "values",
-           "bytes/val", "ratio", "enc MB/s", "dec MB/s", "dec Mval/s", "encodings");
-    printf("%-18s %-7s %10s %9s %8s %10s %10s %10s  %s\n", "------------------", "-------",
+    printf("%-18s %-7s %10s %9s %8s %10s %10s %10s %9s  %s\n", first_column, "type", "values",
+           "bytes/val", "ratio", "enc MB/s", "dec MB/s", "dec Mval/s", "read GB/s", "encodings");
+    printf("%-18s %-7s %10s %9s %8s %10s %10s %10s %9s  %s\n", "------------------", "-------",
            "----------", "---------", "--------", "----------", "----------", "----------",
-           "---------");
+           "---------", "---------");
 }
 
 /* Lists the encodings used, most frequent first, with their share of chunks. */
@@ -476,11 +495,14 @@ static void print_result(const char* name, const bench_column* column, uint32_t 
     double encode_mb = (double)result->raw_bytes / result->encode_seconds / 1e6;
     double decode_mb = (double)result->raw_bytes / result->decode_seconds / 1e6;
     double decode_mvalues = (double)column->count / result->decode_seconds / 1e6;
+    /* Encoded payload bytes read while decoding (NULL bitmaps are not decoded here). */
+    double read_gb =
+        (double)(result->encoded_bytes - result->null_bitmap_bytes) / result->decode_seconds / 1e9;
     char encodings[160];
     format_encodings(result, chunk_count, encodings, sizeof(encodings));
-    printf("%-18s %-7s %10u %9.3f %7.1fx %10.0f %10.0f %10.0f  %s\n", name,
+    printf("%-18s %-7s %10u %9.3f %7.1fx %10.0f %10.0f %10.0f %9.2f  %s\n", name,
            bench_type_name(column->type), column->count, bytes_per_value, ratio, encode_mb,
-           decode_mb, decode_mvalues, encodings);
+           decode_mb, decode_mvalues, read_gb, encodings);
 }
 
 /* ---------------------------------------------------------------------------------------- */
@@ -503,7 +525,7 @@ static bool run_dataset(const bench_dataset* dataset, const bench_options* optio
     if (ok) {
         column.count = options->value_count;
         ok = dataset->generate(&column, 42) &&
-             bench_chunks_fixed(&chunks, column.count, SX_VECTOR_SIZE);
+             bench_chunks_fixed(&chunks, column.count, options->chunk_rows);
     }
     bench_result result;
     ok = ok && run_benchmark(&column, &chunks, options, &result);
@@ -518,8 +540,8 @@ static bool run_dataset(const bench_dataset* dataset, const bench_options* optio
 }
 
 static void print_settings(const bench_options* options) {
-    printf("threads: %u, kernels: %s\n\n", options->threads,
-           sx_simd_level_name(sx_codec_kernels_active()->level));
+    printf("threads: %u, kernels: %s, at most %u values per chunk\n\n", options->threads,
+           sx_simd_level_name(sx_codec_kernels_active()->level), options->chunk_rows);
 }
 
 static int run_datasets(const bench_options* options) {
@@ -608,13 +630,14 @@ static void print_usage(void) {
            "  --values N      values per synthetic dataset (default %u)\n"
            "  --min-time S    minimum seconds per measurement (default %.2f)\n"
            "  --threads N     encode and decode with N threads (default 1)\n"
+           "  --chunk-rows N  at most N values per chunk, 1 to %u (default %u)\n"
            "  --simd LEVEL    codec kernels: scalar, avx2, avx512, or neon (default: the\n"
            "                  best the CPU supports)\n"
            "\n"
            "CSV input: PATH is a file or a directory (every file in it). Each file is one\n"
            "series. TYPE is int64, double, bool, string, timestamp, or decimalN (N = 0..18\n"
            "fraction digits). --split-on starts a new chunk when that field changes.\n",
-           DEFAULT_VALUE_COUNT, DEFAULT_MIN_SECONDS);
+           DEFAULT_VALUE_COUNT, DEFAULT_MIN_SECONDS, SX_VECTOR_SIZE, SX_VECTOR_SIZE);
 }
 
 static void print_datasets(void) {
@@ -658,6 +681,14 @@ static int parse_arguments(int argc, char** argv, bench_options* options) {
                 return 2;
             }
             options->threads = (unsigned)value;
+        } else if (strcmp(arg, "--chunk-rows") == 0 && has_value) {
+            long value = strtol(argv[++i], NULL, 10);
+            if (value < 1 || value > (long)SX_VECTOR_SIZE) {
+                fprintf(stderr, "error: --chunk-rows must be between 1 and %u\n", SX_VECTOR_SIZE);
+                return 2;
+            }
+            options->chunk_rows = (uint32_t)value;
+            options->csv.chunk_rows = (uint32_t)value;
         } else if (strcmp(arg, "--simd") == 0 && has_value) {
             sx_simd_level level;
             const char* name = argv[++i];
@@ -697,6 +728,7 @@ static int parse_arguments(int argc, char** argv, bench_options* options) {
 int main(int argc, char** argv) {
     static bench_options options;
     options.value_count = DEFAULT_VALUE_COUNT;
+    options.chunk_rows = SX_VECTOR_SIZE;
     options.min_seconds = DEFAULT_MIN_SECONDS;
     options.threads = 1;
 

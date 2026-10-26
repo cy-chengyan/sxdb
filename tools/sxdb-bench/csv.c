@@ -537,6 +537,7 @@ static bool load_file(const char* path, const bench_csv_options* options, bench_
     column_file_state states[BENCH_MAX_CSV_COLUMNS] = {0};
     uint32_t row = data->columns[0].count;
     chunk_builder builder = {.start = row};
+    uint32_t chunk_rows = options->chunk_rows != 0 ? options->chunk_rows : SX_VECTOR_SIZE;
     unsigned long line_number = 0;
     bool ok = true;
 
@@ -549,7 +550,7 @@ static bool load_file(const char* path, const bench_csv_options* options, bench_
 
         bool split_here = options->split && options->split_field < field_count &&
                           split_value_changed(&builder, fields[options->split_field]);
-        if (row - builder.start == SX_VECTOR_SIZE || (split_here && row > builder.start)) {
+        if (row - builder.start == chunk_rows || (split_here && row > builder.start)) {
             ok = close_chunk(data, &builder, row);
         }
         if (ok && row == UINT32_MAX - 1u) {

@@ -48,7 +48,9 @@ build/tools/sxdb-bench/sxdb-bench --list          # list the datasets
 build/tools/sxdb-bench/sxdb-bench --csv bars/ --columns 2:timestamp,3:decimal2,7:decimal0 --split-on 9
 ```
 
-The `--csv` form measures columns of your own data. Each path is a CSV file or a directory of them, and every file is treated as one series. Column types are `int64`, `double`, `bool`, `string`, `timestamp`, and `decimalN` (N fraction digits). `--split-on FIELD` starts a new chunk whenever that field changes, which mimics a partition such as one trading day. `--threads N` measures with N threads. `--simd LEVEL` measures one codec kernel set (`scalar`, `avx2`, `avx512`, or `neon`) instead of the best one the CPU supports. Run `sxdb-bench --help` for all options.
+The `--csv` form measures columns of your own data. Each path is a CSV file or a directory of them, and every file is treated as one series. Column types are `int64`, `double`, `bool`, `string`, `timestamp`, and `decimalN` (N fraction digits). `--split-on FIELD` starts a new chunk whenever that field changes, which mimics a partition such as one day. `--chunk-rows N` caps chunks at N values (default 1024), as short series, fine partitions, and the tails of series do. `--threads N` measures with N threads. `--simd LEVEL` measures one codec kernel set (`scalar`, `avx2`, `avx512`, or `neon`) instead of the best one the CPU supports. Run `sxdb-bench --help` for all options.
+
+Encoded chunks are stored back to back, as in a segment file. Besides MB/s and values per second, the report gives `read GB/s`, the encoded bytes read per second while decoding: when it approaches the memory bandwidth of one core, decoding is limited by memory rather than by the codec (see DESIGN.md §16).
 
 ## Documentation
 
