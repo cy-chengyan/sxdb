@@ -46,7 +46,7 @@ This document is the design of sxdb; version 1.0 was the baseline, and later cha
 | Third-party code | Only GPLv2-compatible licenses (BSD, MIT, zlib, public domain, LGPL). **No Apache-2.0 code** |
 | Vendored dependencies | LZ4 (only `lib/`, BSD-2-Clause), ZSTD (BSD or GPLv2 dual license), linenoise (BSD-2-Clause, sxql only) |
 | Optional dependency | Mbed TLS (Apache-2.0 or GPL-2.0-or-later dual license), for TLS |
-| Written in-house | Roaring Bitmap, t-digest, HyperLogLog, ALP, Arrow IPC encoding (including a minimal FlatBuffers encoder), TZif time zone parsing, SHA-256, HMAC, PBKDF2 (for SCRAM), shortest round-trip floating-point formatting (Ryu-style) and fast exact number parsing (Eisel–Lemire-style) |
+| Written in-house | Roaring Bitmap, split-block Bloom filter, XXH64 (stable hashing for on-disk structures), t-digest, HyperLogLog, ALP, Arrow IPC encoding (including a minimal FlatBuffers encoder), TZif time zone parsing, SHA-256, HMAC, PBKDF2 (for SCRAM), shortest round-trip floating-point formatting (Ryu-style) and fast exact number parsing (Eisel–Lemire-style) |
 | Compiler extensions | `__builtin_*`, `__attribute__`, etc. are wrapped in `sx_compiler.h`. C23 features (`[[nodiscard]]`, `<stdbit.h>`, etc.) are used through compatibility macros |
 | Human language | Error messages, logs, and all other system text are English only. Code comments and repository documentation are English only (see §15.2) |
 | Hosting | GitHub (see §15.3) |
@@ -201,6 +201,13 @@ Measured on A-share 1-minute bars (5,571 symbols, 241 rows per symbol per day), 
         ├── 000017.sxs               segment file (immutable)
         └── 000023.sxs
 ```
+
+**Opening a data directory**
+1. **Ownership and permissions**: the directory must be owned by the user the process runs as (the `sxdb` user for an installed server, see §15.4) and have mode 0700 or 0750; otherwise opening is refused with an explanation (see §11.1). This applies to the server and the embedded library alike.
+2. **Lock**: `LOCK` is opened and locked with `flock(LOCK_EX | LOCK_NB)`. If another process holds it, opening is refused with "data directory is in use by process <pid>"; the pid is written into `LOCK` only for this message. The kernel releases the lock when the process exits, even after `kill -9`, so there are no stale locks to clean up.
+3. **Initialization**: a missing or empty directory is initialized by `sxdb init` for the server, which also sets the administrator password (see §15.4), and by `sxdb_open()` in the embedded library, which has no password. The server refuses to start on a directory that is not initialized and says to run `sxdb init`. `FORMAT` (see §14.2) is written last, so its presence marks a complete data directory. A directory that is not empty but has no `FORMAT` is refused as "not an sxdb data directory", so sxdb never writes into a directory that belongs to something else.
+4. **Format check**: `FORMAT` is read and its feature flags are checked (see §14.2) before anything else is read.
+5. **Leftovers**: `*.tmp` files left by an interrupted atomic replacement (see §6.3) are removed.
 
 ### 4.2 Encodings
 
@@ -461,6 +468,23 @@ One per table. It must work from one series to hundreds of millions without requ
 - When a block falls entirely inside the query's time window and filters, the block header's min/max/sum/count/first/last are used directly, without decoding.
 - Aggregations grouped by series use SMA only on blocks flagged as single-series.
 
+### 5.5 Bitmaps and Bloom Filters
+
+Two building blocks of the series index (§5.1) and the segment metadata (§4.4).
+
+**Roaring bitmaps** (64-bit)
+- **On-disk format**: the portable serialization of the Roaring format specification (github.com/RoaringBitmap/RoaringFormatSpec) with its 64-bit extension: a `u64` count of 32-bit bitmaps, then for each, in ascending order, its high 32 bits as a `u32` followed by a standard portable 32-bit bitmap. The Roaring libraries of other languages read the same format, so external tools can inspect what sxdb writes.
+- **Containers**: array (up to 4096 values), bitmap (65,536 bits), and run. Runs matter here: series_ids are assigned consecutively, so the series of a segment or of a tag value often form long ranges that cost a few bytes each.
+- **Read in place**: a serialized bitmap in a buffer pool frame is used through a read-only view, without being copied or converted. Opening a view validates the structure in time proportional to the number of containers (sizes, offsets, container types, and cardinalities against the length of the buffer). Every operation on a view stays inside the buffer whatever its content, so a corrupted bitmap can give wrong results but never reads out of bounds; page CRCs detect the corruption itself.
+- **In memory**: mutable bitmaps hold the in-memory part of the series index, the cached partition active-series bitmaps, and query results. Their containers come from an allocator chosen by the owner: an arena for memory with a shared lifetime (a query, a MemTable generation) or the memory manager for long-lived bitmaps, so every byte counts against `memory_limit`.
+- **Operations**: add, add a range, contains, cardinality, minimum and maximum, ordered iteration in batches, AND, OR, AND NOT (on views and mutable bitmaps in any combination), union of many bitmaps, serialization. The first version is portable C; SIMD kernels for container operations follow in M5 if measurements call for them.
+
+**Bloom filters**
+- **Structure**: the split-block Bloom filter specified for Apache Parquet: 256-bit blocks of eight 32-bit words. A key sets one bit in each word of one block, chosen with eight fixed odd multipliers (salts), so a lookup reads one 32-byte block within one cache line and is branch-free.
+- **Size**: 10 bits per key, for about 1% false positives.
+- **Hashing**: XXH64 with seed 0 over the key bytes, written in-house and checked against the reference test vectors. It is frozen as part of the on-disk format; the in-memory hash (`src/common/hash.h`) may change between releases and is never stored. The high 32 bits choose the block by multiply-shift; the low 32 bits are multiplied by the salts.
+- **Layout**: `u32 block_count | u8 version | u8 reserved[27]`, then the blocks, so the blocks start 32-byte aligned. Like bitmaps, filters are used in place in buffer pool frames.
+
 ---
 
 ## 6. Memory Management
@@ -502,6 +526,17 @@ Every memory consumer allocates through the memory manager and shares one budget
 - The cache holds lightweight-encoded data, not decoded data: the same memory holds several times more data, and decoding is fast enough to do on every use. For ZSTD-compressed cold data, the cache holds the layer below ZSTD.
 - Sequential scans prefetch upcoming pages, first with pread on a thread pool; io_uring may be used on Linux later.
 - In `direct` mode, segment files are written with O_DIRECT. The WAL uses regular writes plus `fdatasync`.
+
+**File layer** (`src/os/`): every file system call of the storage engine goes through it.
+- **Relative to directory handles**: files are opened, renamed, and removed relative to an open directory handle (`openat`, `renameat`, `unlinkat`), and names are single path components. Paths are resolved once, when the data directory is opened, so a directory renamed or replaced while sxdb runs cannot redirect its writes.
+- **Creation**: files are created with mode 0600 and directories with 0700, always with `O_CLOEXEC`.
+- **Full reads and writes**: short reads and writes and `EINTR` are retried; reading past the end of a file is reported as corruption, not as a short read.
+- **Direct IO**: with `O_DIRECT`, buffers, offsets, and lengths are multiples of 4 KB, which covers both 512-byte and 4 KB devices. Buffer pool frames come from anonymous mmap and are page aligned. If the file system refuses `O_DIRECT` (for example tmpfs), the file falls back to regular IO and this is logged once. On macOS, `F_NOCACHE` has no alignment requirement.
+- **Durability**: on Linux, file data is made durable with `fdatasync` and directory entries with `fsync` on the directory. On macOS, `fsync` only reaches the drive's cache, so both use `fcntl(F_FULLFSYNC)`, falling back to `fsync` where the file system does not support it. This is slower, but an acknowledged write must survive a power loss on every platform.
+- **A failed sync is never retried**: after a failure the kernel may already have dropped the dirty pages and would report the next sync as successful (the problem PostgreSQL met in 2018). A failed sync of a new segment or index segment abandons that file, and the flush starts over with a new one; a failed WAL sync switches the instance to `read_only`, and the unacknowledged batches are reported as failed.
+- **Preallocation**: WAL segments are preallocated to their full 64 MB (`posix_fallocate` on Linux, `F_PREALLOCATE` on macOS), so `fdatasync` on an append does not also have to write the file size.
+- **Atomic replacement** of small files (`CURRENT`, `FORMAT`): write `<name>.tmp`, sync it, rename it over `<name>`, sync the directory (see §13).
+- **Errors**: the classes the engine reacts to differently get their own error codes: missing file, file exists, permission denied, no space (`ENOSPC`, `EDQUOT`; this switches the instance to `read_only`, see §12.1), and other IO errors. The failing operation and `errno` are kept per thread for the error message, for example `could not sync file "000017.sxs": Input/output error`.
 
 ---
 
@@ -893,8 +928,9 @@ wal_archive_retention_size = 10G    # keep the archive under 10G
 
 ### 11.1 Process Identity and Deployment
 - The server **refuses to start** as root (uid 0), with no override. All default ports are above 1024, so root is never needed.
+- The subcommands of the operations command `sxdb` that open a data directory or a backup (`init`, `backup`, `restore`, `verify`, `dump`, `upgrade`) refuse to run as root too, and say to run them as the directory's owner, for example `sudo -u sxdb sxdb init`. No file in a data directory is therefore ever created by root.
 - A systemd unit is provided that:
-  - runs as a dedicated `sxdb` user;
+  - runs as the `sxdb` user and group that the package creates (`User=sxdb`, `Group=sxdb`, see §15.4);
   - enables `NoNewPrivileges`, `ProtectSystem=strict`, `PrivateTmp`, `SystemCallFilter=@system-service`;
   - clears `CapabilityBoundingSet`;
   - allows writes only to the data and backup directories.
@@ -1050,6 +1086,13 @@ log_total_size = 4G              # cap on all log files together; the oldest are
   - **SQL regression tests**: sqllogictest format.
   - **Fuzzing**: libFuzzer on the SQL parser, every protocol parser, every decoder, and the file format readers.
   - **Crash injection**: repeated `kill -9` with consistency checks after each, plus fault injection at every fsync and rename point.
+  - **Fault injection layer**: every call of the file layer (§6.3) that changes the file system (create, write, sync, rename, remove, truncate, preallocate, directory sync) passes one hook. The hook is compiled into every build, so tests exercise the code that ships; until a test arms it, it costs one predictable branch per call, next to a system call. Armed, it can:
+    - count the points a workload passes, so a test can enumerate them and stop at each one in turn;
+    - fail the Nth point, or every point of one kind, with a chosen `errno` (for example `EIO`, `ENOSPC`);
+    - stop the process at the Nth point, optionally after writing only part of the data (a torn write);
+    - **simulate a power loss**: data written after a file's last sync is dropped or replaced with random bytes, and creations, renames, and removals not covered by a sync of their directory are undone. `kill -9` alone cannot test this, because the page cache survives the process; this is what checks that every sync is in the right place.
+
+    The arming functions are internal and not part of the public API.
   - **Sanitizers**: ASan, UBSan, TSan in CI.
   - **Static analysis**: clang-tidy, CodeQL.
   - **Upgrade tests**: data directories, WALs, and backups produced by the previous version must upgrade, restore, and read correctly with the new version (from 1.0 on).
@@ -1079,6 +1122,23 @@ Semantic versioning, `MAJOR.MINOR.PATCH`:
 | compat | Ignores it and works normally |
 | ro_compat | Can open the data directory read-only only |
 | incompat | Refuses to open and says "requires sxdb >= x.y" |
+
+**The `FORMAT` file** is plain ASCII text, so `cat FORMAT` shows what a data directory needs:
+
+```
+sxdb-format 1
+directory_id 6f1c2a9e4b7d40e8a3c5f0b2d9e8a714
+created_by 0.1.0
+feature ro_compat example_feature 0.3.0
+crc32c 8b2f61d0
+```
+
+- Lines end with LF. The first line names the file's own layout version. The last line holds the CRC32C of every byte before it, in hexadecimal.
+- `directory_id`: 128 random bits from the operating system's random source, generated when the directory is initialized. Backups and WAL archives record it, so files from different instances are never mixed up.
+- `created_by`: the version that initialized the directory, for diagnosis only.
+- `feature <class> <name> <version>`: one line per enabled feature, with the first version that understands it. A binary that does not know a feature applies its class, and for `incompat` (and `ro_compat` when opening for writing) reports "requires sxdb >= <version>" from this line. A new data directory has no features.
+- Any other line, a missing line, or a CRC mismatch makes the file corrupt, and opening is refused.
+- The file is written with atomic replacement (§6.3): when a directory is initialized, and later only when `sxdb upgrade --finalize` enables new features (§14.3).
 
 ### 14.3 Upgrade Procedure
 1. **Check**: `sxdb upgrade --check` checks the data directory format and whether the configuration file is valid for the new version, and lists deprecated settings.
@@ -1221,10 +1281,12 @@ Pushing a `vX.Y.Z` tag builds and publishes:
 |---|---|
 | deb / rpm | Generated by CPack for x86_64 and arm64, targeting Debian 12+, Ubuntu 22.04+, RHEL/Rocky/Alma 8+. Split into `sxdb-server` (server, `sxdb` operations command, systemd unit), `sxql` (client), and `libsxdb` plus `libsxdb-dev`/`libsxdb-devel` (library and headers) |
 | Homebrew | Initially in our own tap (`homebrew-sxdb`), with prebuilt arm64 and x86_64 bottles. `brew services` runs as the current user, not root |
-| Docker image | amd64 and arm64, based on distroless (no shell), running as a non-root user. Published to GitHub Container Registry |
+| Docker image | amd64 and arm64, based on distroless (no shell), running as user and group `sxdb` with a fixed, documented uid and gid, so a mounted volume can be given the right owner. Published to GitHub Container Registry |
 
 **deb/rpm installation**
-- Creates the `sxdb` system user, `/var/lib/sxdb` (0700), and `/var/log/sxdb`.
+- Creates the `sxdb` system group and the `sxdb` system user (primary group `sxdb`, no password, no login shell). The server and the operations command run as this user (see §11.1).
+- Creates `/var/lib/sxdb` (data) and `/var/log/sxdb` (logs), both owned by `sxdb:sxdb` with permissions 0700.
+- Existing group, user, and directories are reused. Uninstalling keeps the group and the user, so that files left behind are never owned by a uid that is later given to another account.
 - Installs `/etc/sxdb/sxdb.conf` owned by `root:sxdb` with permissions 0640: the service can read its configuration but cannot modify it.
 - **The service is not started automatically after installation**: there is no default password, so `sxdb init` must set the administrator password first. The installer prints this step.
 
