@@ -56,19 +56,41 @@ static uint64_t offset_from(int64_t value, int64_t base) {
 }
 
 /*
+ * A starting point for common_divisor: the gcd of up to four numbers spread over the
+ * chunk, which is a multiple of the gcd of all of them, and often equal to it or 1. It
+ * stops at 1 after two numbers: large random numbers make each gcd slow, and two of them
+ * are coprime more often than not. 0 for short chunks.
+ */
+static uint64_t seed_divisor(const uint64_t* numbers, uint32_t count, uint64_t base) {
+    if (count < 8u) {
+        return 0;
+    }
+    uint64_t a = sx_gcd_u64(numbers[count / 4u] - base, numbers[count / 2u] - base);
+    if (a == 1) {
+        return 1;
+    }
+    uint64_t b = sx_gcd_u64(numbers[(3u * count) / 4u] - base, numbers[count - 1u] - base);
+    return sx_gcd_u64(a, b);
+}
+
+/*
  * Greatest common divisor of numbers[i] - base for i < count, 0 if they are all 0; the
  * quotients by it go to `quotients`. Most numbers are multiples of the divisor found so
  * far, which first_non_multiple confirms cheaply; only the others need a gcd computation.
  * The divisor only shrinks, so that happens rarely, and once it reaches 1 the scan stops.
- * It starts at 0, the divisor of no numbers, whose only multiple is 0.
  *
  * The test computes the quotients by the divisor of the time. Those from the last change
  * of the divisor to the end are final; the numbers before it, and those after the scan
  * stopped at 1, are divided afterwards.
+ *
+ * Each change of the divisor costs a gcd, a new test, and a new scan from the number that
+ * failed, so the search starts from seed_divisor rather than from 0 (the divisor of no
+ * numbers, whose only multiple is 0). A seed of 1 skips the scan, and any seed gives the
+ * same result, since it is a multiple of the answer.
  */
 static uint64_t common_divisor(const sx_codec_kernels* kernels, const uint64_t* numbers,
                                uint32_t count, uint64_t base, uint64_t* quotients) {
-    uint64_t divisor = 0;
+    uint64_t divisor = seed_divisor(numbers, count, base);
     sx_exact_divisor exact = {.shift = 0, .inverse = 1}; /* for 0 and 1: no division */
     uint32_t settled = 0; /* quotients[settled, tested) are by the current divisor */
     uint32_t tested = 0;
