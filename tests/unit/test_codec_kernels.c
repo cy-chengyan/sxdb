@@ -288,6 +288,78 @@ static void test_decode_deltas_matches_scalar(void) {
     }
 }
 
+/*
+ * Every row count, each with a random number of values in the last row, for the decoders
+ * whose AVX-512 kernels unroll the rows of a block and stop after the last one. Both outputs
+ * start with the same garbage and are compared in full, so a value written past the
+ * contract would also differ.
+ */
+static void test_every_row_count_matches_scalar(void) {
+    const sx_codec_kernels* scalar = level_kernels(SX_SIMD_SCALAR);
+    sx_simd_level levels[SX_SIMD_LEVEL_COUNT];
+    uint32_t level_count = simd_levels(levels);
+    sx_rng rng;
+    sx_rng_seed(&rng, 11);
+    static const uint64_t multipliers[] = {1, 100};
+    uint8_t packed[MAX_PACKED];
+    uint64_t expected[SX_DELTA_SCRATCH_SIZE];
+    uint64_t actual[SX_DELTA_SCRATCH_SIZE];
+    double expected_doubles[SX_DELTA_SCRATCH_SIZE];
+    double actual_doubles[SX_DELTA_SCRATCH_SIZE];
+    uint64_t expected_totals[SX_BITPACK_LANES];
+    uint64_t actual_totals[SX_BITPACK_LANES];
+    for (uint32_t width = 0; width <= 64; width++) {
+        for (uint32_t rows = 1; rows <= SX_VECTOR_SIZE / SX_BITPACK_LANES; rows++) {
+            uint32_t count = (rows - 1u) * SX_BITPACK_LANES + 1u +
+                             (uint32_t)sx_rng_below(&rng, SX_BITPACK_LANES);
+            uint32_t slot_count = count < SX_VECTOR_SIZE ? count : SX_VECTOR_SIZE - 1u;
+            fill_random(&rng, packed, sx_bitpack_size(count, width));
+            uint64_t base = sx_rng_next(&rng);
+            sx_alp_scales scales = random_scales(&rng);
+            for (uint32_t l = 0; l < level_count; l++) {
+                const sx_codec_kernels* kernels = level_kernels(levels[l]);
+                const char* name = sx_simd_level_name(levels[l]);
+                for (size_t m = 0; m < SX_ARRAY_SIZE(multipliers); m++) {
+                    uint64_t multiplier = multipliers[m];
+                    memset(expected, 0x5A, sizeof(expected));
+                    memset(actual, 0x5A, sizeof(actual));
+                    scalar->decode_for(packed, count, width, base, multiplier, expected);
+                    kernels->decode_for(packed, count, width, base, multiplier, actual);
+                    if (memcmp(actual, expected, sizeof(expected)) != 0) {
+                        sx_test_fail(__FILE__, __LINE__,
+                                     "%s decode_for differs: width %u count %u multiplier %" PRIu64,
+                                     name, width, count, multiplier);
+                        return;
+                    }
+                    memset(expected, 0x5A, sizeof(expected));
+                    memset(actual, 0x5A, sizeof(actual));
+                    scalar->decode_deltas(packed, slot_count, width, base, multiplier, expected,
+                                          expected_totals);
+                    kernels->decode_deltas(packed, slot_count, width, base, multiplier, actual,
+                                           actual_totals);
+                    if (memcmp(actual, expected, sizeof(expected)) != 0 ||
+                        memcmp(actual_totals, expected_totals, sizeof(expected_totals)) != 0) {
+                        sx_test_fail(
+                            __FILE__, __LINE__,
+                            "%s decode_deltas differs: width %u, %u slots, multiplier %" PRIu64,
+                            name, width, slot_count, multiplier);
+                        return;
+                    }
+                }
+                memset(expected_doubles, 0x5A, sizeof(expected_doubles));
+                memset(actual_doubles, 0x5A, sizeof(actual_doubles));
+                scalar->decode_alp(packed, count, width, base, &scales, expected_doubles);
+                kernels->decode_alp(packed, count, width, base, &scales, actual_doubles);
+                if (memcmp(actual_doubles, expected_doubles, sizeof(expected_doubles)) != 0) {
+                    sx_test_fail(__FILE__, __LINE__, "%s decode_alp differs: width %u count %u",
+                                 name, width, count);
+                    return;
+                }
+            }
+        }
+    }
+}
+
 static void test_rebuild_deltas_matches_scalar(void) {
     const sx_codec_kernels* scalar = level_kernels(SX_SIMD_SCALAR);
     sx_simd_level levels[SX_SIMD_LEVEL_COUNT];
@@ -851,6 +923,7 @@ static const sx_test_case cases[] = {
     {"unpack_and_decode_for_match_scalar", test_unpack_and_decode_for_match_scalar},
     {"decode_alp_matches_scalar", test_decode_alp_matches_scalar},
     {"decode_deltas_matches_scalar", test_decode_deltas_matches_scalar},
+    {"every_row_count_matches_scalar", test_every_row_count_matches_scalar},
     {"rebuild_deltas_matches_scalar", test_rebuild_deltas_matches_scalar},
     {"encode_alp_matches_scalar", test_encode_alp_matches_scalar},
     {"summarize_ints_matches_scalar", test_summarize_ints_matches_scalar},

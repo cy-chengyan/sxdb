@@ -24,23 +24,50 @@ add_library(sxdb STATIC
     encoding/kernels_scalar.c
     encoding/string_codec.c)
 
+# The target architectures. On macOS that is CMAKE_OSX_ARCHITECTURES when set, because
+# CMAKE_SYSTEM_PROCESSOR names the host there. A universal build lists several, and each
+# x86_64-only flag is then preceded by -Xarch_x86_64, which passes the next argument to the
+# x86_64 slice only.
+if(APPLE AND CMAKE_OSX_ARCHITECTURES)
+    set(sxdb_target_archs ${CMAKE_OSX_ARCHITECTURES})
+else()
+    set(sxdb_target_archs ${CMAKE_SYSTEM_PROCESSOR})
+endif()
+list(LENGTH sxdb_target_archs sxdb_target_arch_count)
+
+# Intel cores from Skylake to Cascade Lake with the microcode update for their jump
+# conditional code (JCC) erratum do not keep a jump that crosses or ends on a 32-byte
+# boundary in the decoded-instruction cache. A hot loop can then run up to 25% slower only
+# because of where the linker puts it, as the codec kernels did. The assembler pads such
+# jumps away for about 2.5% more code; other CPUs are unaffected. Clang takes the option
+# directly, GCC passes it to the GNU assembler (binutils 2.34 and later).
+if(sxdb_target_archs MATCHES "(^|;)(x86_64|AMD64|amd64)(;|$)")
+    if(sxdb_target_arch_count GREATER 1)
+        # Universal builds need Apple clang, which knows the option.
+        target_compile_options(sxdb PRIVATE "SHELL:-Xarch_x86_64 -mbranches-within-32B-boundaries")
+    else()
+        include(CheckCCompilerFlag)
+        check_c_compiler_flag(-mbranches-within-32B-boundaries SXDB_HAVE_BRANCH_ALIGNMENT)
+        if(SXDB_HAVE_BRANCH_ALIGNMENT)
+            target_compile_options(sxdb PRIVATE -mbranches-within-32B-boundaries)
+        else()
+            check_c_compiler_flag(-Wa,-mbranches-within-32B-boundaries
+                SXDB_HAVE_ASSEMBLER_BRANCH_ALIGNMENT)
+            if(SXDB_HAVE_ASSEMBLER_BRANCH_ALIGNMENT)
+                target_compile_options(sxdb PRIVATE -Wa,-mbranches-within-32B-boundaries)
+            endif()
+        endif()
+    endif()
+endif()
+
 # SIMD codec kernels. Each instruction set lives in its own file, compiled with the flags
 # for that set only; kernels.c calls them after checking the CPU (see encoding/kernels.h).
 # The x86_64 sets are the integer instructions of the x86-64-v3 and x86-64-v4 levels,
 # spelled out because GCC before 11 does not know the level names.
 #
-# The files follow the target architecture, as kernels.c does. On macOS that is
-# CMAKE_OSX_ARCHITECTURES when set, because CMAKE_SYSTEM_PROCESSOR names the host there.
-# A universal build lists several: every slice then compiles every kernel file (each is
-# empty outside its own architecture), and each x86_64 flag is preceded by -Xarch_x86_64,
-# which passes the next argument to the x86_64 slice only.
+# The files follow the target architecture, as kernels.c does. A universal build compiles
+# every kernel file in every slice (each is empty outside its own architecture).
 if(SXDB_SIMD)
-    if(APPLE AND CMAKE_OSX_ARCHITECTURES)
-        set(sxdb_target_archs ${CMAKE_OSX_ARCHITECTURES})
-    else()
-        set(sxdb_target_archs ${CMAKE_SYSTEM_PROCESSOR})
-    endif()
-    list(LENGTH sxdb_target_archs sxdb_target_arch_count)
     foreach(sxdb_arch IN LISTS sxdb_target_archs)
         if(sxdb_arch MATCHES "^(x86_64|AMD64|amd64)$")
             set(sxdb_x86_64_v3_flags -mavx2 -mbmi -mbmi2 -mlzcnt -mpopcnt)

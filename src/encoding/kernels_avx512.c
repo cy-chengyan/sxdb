@@ -118,6 +118,173 @@ static void bitunpack_avx512(const uint8_t* packed, uint32_t count, uint32_t wid
     }
 }
 
+/* ---------------------------------------------------------------------------------------- */
+/* Decoding with the rows unrolled for each width                                           */
+/* ---------------------------------------------------------------------------------------- */
+
+/*
+ * For widths 1 to UNROLLED_MAX_WIDTH, FOR and delta decoding with multiplier 1 and ALP
+ * decoding have one function per width with the 64 rows of a block unrolled, as in
+ * FastLanes. Every shift count is then a constant, each packed word is loaded once and kept
+ * in a register for all rows that use it, and a row that continues in the next word needs
+ * no branch. The row loops below recompute the bit position, broadcast the shift counts,
+ * and test for that case on every row, which takes 1.5 to 2 times the instructions; they
+ * remain for the other widths and multipliers. These widths cover common data (the A-share
+ * 1-minute bars pack 2 to 28 bits), and the functions take about 500 KB of code.
+ *
+ * Rows go in ascending order, so that packed data read from memory streams through the
+ * hardware prefetchers, and a check before each row stops after the last one. The pointers
+ * are restrict-qualified, which lets the compiler keep packed words in registers across
+ * the stores of the decoded rows.
+ */
+
+#define UNROLLED_MAX_WIDTH 32u
+#define MAX_ROWS           (SX_VECTOR_SIZE / SX_BITPACK_LANES) /* 64, the unroll count below */
+
+/* Unpacks row `row` of a block packed at `width` bits; both are constants after inlining. */
+static SX_ALWAYS_INLINE void unpack_fixed_row(const uint8_t* restrict packed, uint32_t row,
+                                              uint32_t width, __m512i* v) {
+    uint32_t bit_position = row * width;
+    uint32_t offset = bit_position % 64u;
+    const uint8_t* low = packed + (bit_position / 64u) * SX_BITPACK_ROW_BYTES;
+    __m512i mask = _mm512_set1_epi64((long long)sx_low_mask_u64(width));
+    for (uint32_t q = 0; q < VECTORS_PER_ROW; q++) {
+        __m512i word = _mm512_loadu_si512(low + q * sizeof(__m512i));
+        if (offset == 0) {
+            v[q] = _mm512_and_si512(word, mask);
+        } else if (offset + width < 64u) {
+            v[q] = _mm512_and_si512(_mm512_srli_epi64(word, offset), mask);
+        } else if (offset + width == 64u) {
+            /* The value ends at the top of the word. */
+            v[q] = _mm512_srli_epi64(word, offset);
+        } else {
+            /* (word >> offset | next << (64 - offset)) & mask in one ternary logic operation. */
+            __m512i next = _mm512_loadu_si512(low + SX_BITPACK_ROW_BYTES + q * sizeof(__m512i));
+            v[q] = _mm512_ternarylogic_epi64(_mm512_srli_epi64(word, offset),
+                                             _mm512_slli_epi64(next, 64u - offset), mask, 0xa8);
+        }
+    }
+}
+
+static SX_ALWAYS_INLINE void decode_for_fixed(const uint8_t* restrict packed, uint32_t rows,
+                                              uint32_t width, uint64_t base,
+                                              uint64_t* restrict out) {
+    __m512i base_vector = _mm512_set1_epi64((long long)base);
+#pragma GCC unroll 64
+    for (uint32_t row = 0; row < MAX_ROWS; row++) {
+        if (row == rows) {
+            break;
+        }
+        __m512i v[VECTORS_PER_ROW];
+        unpack_fixed_row(packed, row, width, v);
+        uint64_t* dst = out + (size_t)row * SX_BITPACK_LANES;
+        _mm512_storeu_si512(dst, _mm512_add_epi64(v[0], base_vector));
+        _mm512_storeu_si512(dst + VECTOR_LANES, _mm512_add_epi64(v[1], base_vector));
+    }
+}
+
+/* Decodes the deltas into scratch rows 1 to `rows` and sums up each lane on the way. */
+static SX_ALWAYS_INLINE void decode_deltas_fixed(const uint8_t* restrict packed, uint32_t rows,
+                                                 uint32_t width, uint64_t base,
+                                                 uint64_t* restrict scratch,
+                                                 uint64_t* restrict lane_totals) {
+    __m512i base_vector = _mm512_set1_epi64((long long)base);
+    __m512i totals[VECTORS_PER_ROW] = {_mm512_setzero_si512(), _mm512_setzero_si512()};
+#pragma GCC unroll 64
+    for (uint32_t row = 0; row < MAX_ROWS; row++) {
+        if (row == rows) {
+            break;
+        }
+        __m512i v[VECTORS_PER_ROW];
+        unpack_fixed_row(packed, row, width, v);
+        uint64_t* dst = scratch + (size_t)(row + 1u) * SX_BITPACK_LANES;
+        for (uint32_t q = 0; q < VECTORS_PER_ROW; q++) {
+            __m512i delta = _mm512_add_epi64(v[q], base_vector);
+            _mm512_storeu_si512(dst + q * VECTOR_LANES, delta);
+            totals[q] = _mm512_add_epi64(totals[q], delta);
+        }
+    }
+    _mm512_storeu_si512(lane_totals, totals[0]);
+    _mm512_storeu_si512(lane_totals + VECTOR_LANES, totals[1]);
+}
+
+static SX_ALWAYS_INLINE void decode_alp_fixed(const uint8_t* restrict packed, uint32_t rows,
+                                              uint32_t width, uint64_t base,
+                                              const sx_alp_scales* scales, double* restrict out) {
+    __m512i shifted_base = _mm512_set1_epi64((long long)(base + SX_ALP_MAGIC_BITS));
+    __m512d magic = _mm512_set1_pd(SX_ALP_MAGIC);
+    __m512d factor = _mm512_set1_pd(scales->decode_factor);
+    __m512d exponent = _mm512_set1_pd(scales->decode_exponent);
+#pragma GCC unroll 64
+    for (uint32_t row = 0; row < MAX_ROWS; row++) {
+        if (row == rows) {
+            break;
+        }
+        __m512i v[VECTORS_PER_ROW];
+        unpack_fixed_row(packed, row, width, v);
+        double* dst = out + (size_t)row * SX_BITPACK_LANES;
+        for (uint32_t q = 0; q < VECTORS_PER_ROW; q++) {
+            /* As in decode_alp_avx512: (base + offset) + MAGIC_BITS is digits + MAGIC. */
+            __m512d x = _mm512_castsi512_pd(_mm512_add_epi64(v[q], shifted_base));
+            x = _mm512_mul_pd(_mm512_mul_pd(_mm512_sub_pd(x, magic), factor), exponent);
+            _mm512_storeu_pd(dst + q * VECTOR_LANES, x);
+        }
+    }
+}
+
+/* X(w) for every unrolled width w (clang-format would reflow the list differently each run). */
+/* clang-format off */
+#define UNROLLED_WIDTHS(X)                                                                         \
+    X(1)  X(2)  X(3)  X(4)  X(5)  X(6)  X(7)  X(8)                                                 \
+    X(9)  X(10) X(11) X(12) X(13) X(14) X(15) X(16)                                                \
+    X(17) X(18) X(19) X(20) X(21) X(22) X(23) X(24)                                                \
+    X(25) X(26) X(27) X(28) X(29) X(30) X(31) X(32)
+/* clang-format on */
+
+#define DEFINE_UNROLLED(w)                                                                         \
+    static void decode_for_width_##w(const uint8_t* restrict packed, uint32_t rows, uint64_t base, \
+                                     uint64_t* restrict out) {                                     \
+        decode_for_fixed(packed, rows, w, base, out);                                              \
+    }                                                                                              \
+    static void decode_deltas_width_##w(const uint8_t* restrict packed, uint32_t rows,             \
+                                        uint64_t base, uint64_t* restrict scratch,                 \
+                                        uint64_t* restrict lane_totals) {                          \
+        decode_deltas_fixed(packed, rows, w, base, scratch, lane_totals);                          \
+    }                                                                                              \
+    static void decode_alp_width_##w(const uint8_t* restrict packed, uint32_t rows, uint64_t base, \
+                                     const sx_alp_scales* scales, double* restrict out) {          \
+        decode_alp_fixed(packed, rows, w, base, scales, out);                                      \
+    }
+
+UNROLLED_WIDTHS(DEFINE_UNROLLED)
+
+typedef void (*decode_for_width_fn)(const uint8_t* packed, uint32_t rows, uint64_t base,
+                                    uint64_t* out);
+typedef void (*decode_deltas_width_fn)(const uint8_t* packed, uint32_t rows, uint64_t base,
+                                       uint64_t* scratch, uint64_t* lane_totals);
+typedef void (*decode_alp_width_fn)(const uint8_t* packed, uint32_t rows, uint64_t base,
+                                    const sx_alp_scales* scales, double* out);
+
+#define FOR_ENTRY(w)    decode_for_width_##w,
+#define DELTAS_ENTRY(w) decode_deltas_width_##w,
+#define ALP_ENTRY(w)    decode_alp_width_##w,
+
+/* Indexed by width; entry 0 is unused. */
+static const decode_for_width_fn decode_for_by_width[UNROLLED_MAX_WIDTH + 1u] = {
+    NULL, UNROLLED_WIDTHS(FOR_ENTRY)};
+static const decode_deltas_width_fn decode_deltas_by_width[UNROLLED_MAX_WIDTH + 1u] = {
+    NULL, UNROLLED_WIDTHS(DELTAS_ENTRY)};
+static const decode_alp_width_fn decode_alp_by_width[UNROLLED_MAX_WIDTH + 1u] = {
+    NULL, UNROLLED_WIDTHS(ALP_ENTRY)};
+
+static inline bool unrolled_width(uint32_t width) {
+    return width >= 1u && width <= UNROLLED_MAX_WIDTH;
+}
+
+/* ---------------------------------------------------------------------------------------- */
+/* Row loops for every width                                                                */
+/* ---------------------------------------------------------------------------------------- */
+
 /* Broadcast constants of frame-of-reference decoding. */
 typedef struct for_constants {
     __m512i mask;
@@ -163,8 +330,13 @@ static SX_ALWAYS_INLINE void decode_for_rows(const uint8_t* packed, uint32_t cou
 /* Each kind of multiplication gets its own copy of the loop. */
 static void decode_for_avx512(const uint8_t* packed, uint32_t count, uint32_t width, uint64_t base,
                               uint64_t multiplier, uint64_t* out) {
+    sx_multiply_kind kind = sx_multiply_kind_of(width, multiplier);
+    if (kind == SX_MULTIPLY_NONE && unrolled_width(width)) {
+        decode_for_by_width[width](packed, sx_bitpack_rows(count), base, out);
+        return;
+    }
     for_constants c = make_for_constants(width, base, multiplier);
-    switch (sx_multiply_kind_of(width, multiplier)) {
+    switch (kind) {
         case SX_MULTIPLY_NONE:
             decode_for_rows(packed, count, width, &c, SX_MULTIPLY_NONE, out);
             break;
@@ -179,6 +351,10 @@ static void decode_for_avx512(const uint8_t* packed, uint32_t count, uint32_t wi
 
 static void decode_alp_avx512(const uint8_t* packed, uint32_t count, uint32_t width, uint64_t base,
                               const sx_alp_scales* scales, double* out) {
+    if (unrolled_width(width)) {
+        decode_alp_by_width[width](packed, sx_bitpack_rows(count), base, scales, out);
+        return;
+    }
     __m512i mask = _mm512_set1_epi64((long long)sx_low_mask_u64(width));
     uint64_t magic_base = base + SX_ALP_MAGIC_BITS;
     __m512i shifted_base = _mm512_set1_epi64((long long)magic_base);
@@ -260,7 +436,11 @@ static void decode_deltas_avx512(const uint8_t* packed, uint32_t slot_count, uin
     zero_rows(scratch, 1);
     switch (sx_multiply_kind_of(width, multiplier)) {
         case SX_MULTIPLY_NONE:
-            decode_deltas_rows(packed, rows, width, &c, SX_MULTIPLY_NONE, scratch, lane_totals);
+            if (unrolled_width(width)) {
+                decode_deltas_by_width[width](packed, rows, base, scratch, lane_totals);
+            } else {
+                decode_deltas_rows(packed, rows, width, &c, SX_MULTIPLY_NONE, scratch, lane_totals);
+            }
             break;
         case SX_MULTIPLY_NARROW:
             decode_deltas_rows(packed, rows, width, &c, SX_MULTIPLY_NARROW, scratch, lane_totals);
