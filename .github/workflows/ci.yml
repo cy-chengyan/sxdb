@@ -64,7 +64,14 @@ jobs:
           cmake -S . -B build -DSXDB_WERROR=ON $extra
       - name: Build
         run: cmake --build build --parallel
+      # On Linux, ASan in GCC 13 and recent Clang checks for use of the stack after return by
+      # default. Each call of a small helper that takes the address of a local (such as the
+      # unaligned loads in common/bits.h) then allocates a fake stack frame, which makes the
+      # Debug tests 50 to 100 times slower (the Roaring tests take about 20 minutes instead
+      # of seconds). The other ASan checks stay on, as on macOS, where this one is off.
       - name: Unit tests
+        env:
+          ASAN_OPTIONS: ${{ matrix.variant == 'asan-ubsan' && 'detect_stack_use_after_return=0' || '' }}
         run: ctest --test-dir build --output-on-failure
       - name: Benchmark smoke test
         if: matrix.variant == 'release'
