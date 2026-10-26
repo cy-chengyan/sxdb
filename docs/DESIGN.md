@@ -3,7 +3,7 @@
 | Item | Value |
 |---|---|
 | Document version | 1.2 |
-| Status | Milestone M0 (foundation and encodings) in progress |
+| Status | Milestone M1 (storage engine) in progress; plan in `docs/M1-PLAN.md` |
 | Date | 2026-10-17 |
 | License | GPL-2.0-or-later (the Python client is MIT) |
 
