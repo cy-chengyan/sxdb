@@ -3,6 +3,7 @@
 #include "mem/arena.h"
 
 #include "common/bits.h"
+#include "common/compiler.h"
 
 #include <stdbool.h>
 #include <stdlib.h>
@@ -114,4 +115,23 @@ void* sx_arena_alloc(sx_arena* arena, size_t size, size_t alignment) {
 
 uint64_t sx_arena_reserved_bytes(const sx_arena* arena) {
     return arena->reserved;
+}
+
+static void* arena_allocate(void* context, size_t size) {
+    return sx_arena_alloc(context, size > 0 ? size : 1, 16);
+}
+
+static void arena_release(void* context, void* memory, size_t size) {
+    SX_UNUSED(context);
+    SX_UNUSED(memory);
+    SX_UNUSED(size);
+}
+
+sx_allocator sx_arena_allocator(sx_arena* arena) {
+    sx_allocator allocator = {
+        .allocate = arena_allocate,
+        .release = arena_release,
+        .context = arena,
+    };
+    return allocator;
 }

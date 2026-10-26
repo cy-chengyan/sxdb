@@ -18,6 +18,16 @@ const char* sx_err_str(sx_err err) {
             return "limit exceeded";
         case SX_ERR_UNSUPPORTED:
             return "operation not supported";
+        case SX_ERR_NOT_FOUND:
+            return "no such file or directory";
+        case SX_ERR_EXISTS:
+            return "file exists";
+        case SX_ERR_PERMISSION:
+            return "permission denied";
+        case SX_ERR_NO_SPACE:
+            return "no space left on device";
+        case SX_ERR_BUSY:
+            return "resource is in use";
     }
     return "unknown error";
 }

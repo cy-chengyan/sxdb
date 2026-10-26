@@ -5,6 +5,11 @@ add_executable(sxdb-unit-tests
     unit/test_common.c
     unit/test_log.c
     unit/test_mem.c
+    unit/test_os_file.c
+    unit/test_os_fault.c
+    unit/test_bloom.c
+    unit/test_roaring.c
+    unit/test_data_dir.c
     unit/test_bitpack.c
     unit/test_int_codec.c
     unit/test_float_codec.c
@@ -17,6 +22,11 @@ set(sxdb_unit_suites
     common
     log
     mem
+    os_file
+    os_fault
+    bloom
+    roaring
+    data_dir
     bitpack
     int_codec
     float_codec

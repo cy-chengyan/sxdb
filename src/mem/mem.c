@@ -242,3 +242,34 @@ const char* sx_mem_pool_name(sx_mem_pool pool) {
     }
     return "unknown";
 }
+
+/*
+ * The C heap with accounting. The allocator's own bookkeeping per allocation is not
+ * counted; it is small next to the containers and buffers allocated this way.
+ */
+static void* heap_allocate(void* context, size_t size) {
+    sx_mem_heap* heap = context;
+    if (sx_mem_reserve(heap->manager, heap->pool, size) != SX_OK) {
+        return NULL;
+    }
+    void* memory = malloc(size > 0 ? size : 1);
+    if (memory == NULL) {
+        sx_mem_unreserve(heap->manager, heap->pool, size);
+    }
+    return memory;
+}
+
+static void heap_release(void* context, void* memory, size_t size) {
+    sx_mem_heap* heap = context;
+    free(memory);
+    sx_mem_unreserve(heap->manager, heap->pool, size);
+}
+
+sx_allocator sx_mem_heap_allocator(sx_mem_heap* heap) {
+    sx_allocator allocator = {
+        .allocate = heap_allocate,
+        .release = heap_release,
+        .context = heap,
+    };
+    return allocator;
+}

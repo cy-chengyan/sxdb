@@ -179,3 +179,11 @@ bool sx_os_cpu_has_x86_64_v4(void) {
     return false;
 #endif
 }
+
+uint32_t sx_os_effective_uid(void) {
+    return (uint32_t)geteuid();
+}
+
+uint64_t sx_os_process_id(void) {
+    return (uint64_t)getpid();
+}

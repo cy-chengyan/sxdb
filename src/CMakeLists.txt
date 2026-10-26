@@ -3,15 +3,22 @@
 find_package(Threads REQUIRED)
 
 add_library(sxdb STATIC
+    common/allocator.c
+    common/bloom.c
     common/clock.c
     common/crc32c.c
     common/error.c
     common/hash.c
     common/log.c
     common/parse.c
+    common/roaring.c
+    common/roaring_container.c
     common/varint.c
+    common/xxhash.c
+    os/os_fault.c
     os/os_file.c
     os/os_mem.c
+    os/os_random.c
     os/os_sysinfo.c
     mem/arena.c
     mem/mem.c
@@ -22,7 +29,9 @@ add_library(sxdb STATIC
     encoding/int_codec.c
     encoding/kernels.c
     encoding/kernels_scalar.c
-    encoding/string_codec.c)
+    encoding/string_codec.c
+    storage/data_dir.c
+    storage/format.c)
 
 # The target architectures. On macOS that is CMAKE_OSX_ARCHITECTURES when set, because
 # CMAKE_SYSTEM_PROCESSOR names the host there. A universal build lists several, and each

@@ -1179,13 +1179,15 @@ sxdb/
 ├── README.md
 ├── include/sxdb.h          public embedded API
 ├── src/
-│   ├── common/             arena, hash, crc32c, varint, roaring, epoch (EBR), log, config
-│   ├── os/                 file IO (O_DIRECT / F_NOCACHE), event loop, threads, system info (cgroup)
-│   ├── mem/                memory manager, buffer pool
+│   ├── common/             allocator, hash, xxhash, crc32c, varint, roaring, bloom, epoch (EBR),
+│   │                       log, config
+│   ├── os/                 file IO (O_DIRECT / F_NOCACHE), fault injection, event loop, threads,
+│   │                       system info (cgroup)
+│   ├── mem/                memory manager, arenas, buffer pool
 │   ├── encoding/           bitpack, for, delta, alp, alp_rd, rle, dict, string
 │   ├── storage/            wal, memtable, segment, partition, manifest, compaction,
 │   │                       series_index, symbol_dict, catalog, bulk_import, last_cache,
-│   │                       views (continuous aggregates), format (feature flags)
+│   │                       views (continuous aggregates), format (feature flags), data_dir
 │   ├── sql/                lexer, parser, binder, planner, optimizer
 │   ├── exec/               vector, scan, filter, project, agg, window, asof_join,
 │   │                       hash_join, sort, gapfill, functions/

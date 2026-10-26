@@ -23,6 +23,11 @@
 extern const sx_test_suite sx_test_suite_common;
 extern const sx_test_suite sx_test_suite_log;
 extern const sx_test_suite sx_test_suite_mem;
+extern const sx_test_suite sx_test_suite_os_file;
+extern const sx_test_suite sx_test_suite_os_fault;
+extern const sx_test_suite sx_test_suite_bloom;
+extern const sx_test_suite sx_test_suite_roaring;
+extern const sx_test_suite sx_test_suite_data_dir;
 extern const sx_test_suite sx_test_suite_bitpack;
 extern const sx_test_suite sx_test_suite_int_codec;
 extern const sx_test_suite sx_test_suite_float_codec;
@@ -30,13 +35,10 @@ extern const sx_test_suite sx_test_suite_bool_string_codec;
 extern const sx_test_suite sx_test_suite_codec_kernels;
 
 static const sx_test_suite* const all_suites[] = {
-    &sx_test_suite_common,
-    &sx_test_suite_log,
-    &sx_test_suite_mem,
-    &sx_test_suite_bitpack,
-    &sx_test_suite_int_codec,
-    &sx_test_suite_float_codec,
-    &sx_test_suite_bool_string_codec,
+    &sx_test_suite_common,        &sx_test_suite_log,         &sx_test_suite_mem,
+    &sx_test_suite_os_file,       &sx_test_suite_os_fault,    &sx_test_suite_bloom,
+    &sx_test_suite_roaring,       &sx_test_suite_data_dir,    &sx_test_suite_bitpack,
+    &sx_test_suite_int_codec,     &sx_test_suite_float_codec, &sx_test_suite_bool_string_codec,
     &sx_test_suite_codec_kernels,
 };
 

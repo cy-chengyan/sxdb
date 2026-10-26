@@ -12,6 +12,7 @@
 #ifndef SX_MEM_ARENA_H
 #define SX_MEM_ARENA_H
 
+#include "common/allocator.h"
 #include "mem/mem.h"
 
 #include <stddef.h>
@@ -36,5 +37,11 @@ void sx_arena_reset(sx_arena* arena);
 
 /* Bytes currently reserved from the memory manager by this arena. */
 uint64_t sx_arena_reserved_bytes(const sx_arena* arena);
+
+/*
+ * An allocator (common/allocator.h) over `arena`, for structures that share its lifetime.
+ * Releasing does nothing; the memory returns when the arena is reset or destroyed.
+ */
+sx_allocator sx_arena_allocator(sx_arena* arena);
 
 #endif /* SX_MEM_ARENA_H */

@@ -18,6 +18,7 @@
 #ifndef SX_MEM_MEM_H
 #define SX_MEM_MEM_H
 
+#include "common/allocator.h"
 #include "common/error.h"
 
 #include <stddef.h>
@@ -108,5 +109,17 @@ void sx_mem_free(sx_mem_manager* manager, sx_mem_pool pool, void* memory, size_t
 void sx_mem_get_stats(const sx_mem_manager* manager, sx_mem_stats* stats);
 
 const char* sx_mem_pool_name(sx_mem_pool pool);
+
+/* Context of sx_mem_heap_allocator; must outlive the allocator. */
+typedef struct sx_mem_heap {
+    sx_mem_manager* manager;
+    sx_mem_pool pool;
+} sx_mem_heap;
+
+/*
+ * An allocator (common/allocator.h) over the C heap that reserves every allocation in
+ * `heap->pool` first, for long-lived structures with many small parts such as bitmaps.
+ */
+sx_allocator sx_mem_heap_allocator(sx_mem_heap* heap);
 
 #endif /* SX_MEM_MEM_H */

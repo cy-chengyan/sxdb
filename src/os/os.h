@@ -54,6 +54,18 @@ bool sx_os_cpu_has_x86_64_v3(void);
  */
 bool sx_os_cpu_has_x86_64_v4(void);
 
+/* Effective user id of the process. */
+uint32_t sx_os_effective_uid(void);
+
+/* Id of the process. */
+uint64_t sx_os_process_id(void);
+
+/*
+ * Fills `buffer` with `size` bytes from the operating system's cryptographically secure
+ * random source.
+ */
+sx_err sx_os_random_bytes(void* buffer, size_t size);
+
 /* Writes all `size` bytes to `fd`, retrying on short writes and interrupts. */
 sx_err sx_os_write_all(int fd, const void* data, size_t size);
 
