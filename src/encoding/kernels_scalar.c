@@ -159,6 +159,23 @@ static uint32_t encode_alp_scalar(const double* values, uint32_t count, const sx
     return exceptions;
 }
 
+static void try_alp_pairs_scalar(const double* values, uint32_t count, const sx_alp_scales* scales,
+                                 uint32_t pair_count, sx_alp_trial* trials) {
+    for (uint32_t p = 0; p < pair_count; p++) {
+        sx_alp_trial trial = {.range = {.min = INT64_MAX, .max = INT64_MIN}, .exceptions = 0};
+        for (uint32_t i = 0; i < count; i++) {
+            int64_t digits;
+            if (!sx_alp_encode_value(values[i], &scales[p], &digits)) {
+                trial.exceptions++;
+                continue;
+            }
+            trial.range.min = digits < trial.range.min ? digits : trial.range.min;
+            trial.range.max = digits > trial.range.max ? digits : trial.range.max;
+        }
+        trials[p] = trial;
+    }
+}
+
 static void summarize_ints_scalar(const int64_t* values, uint32_t count, uint64_t* deltas,
                                   sx_int_summary* summary) {
     sx_summary_start(values, count, summary);
@@ -250,6 +267,7 @@ const sx_codec_kernels sx_kernels_scalar = {
     .rebuild_deltas = rebuild_deltas_scalar,
     .fill_arithmetic = fill_arithmetic_scalar,
     .encode_alp = encode_alp_scalar,
+    .try_alp_pairs = try_alp_pairs_scalar,
     .summarize_ints = summarize_ints_scalar,
     .first_non_multiple = first_non_multiple_scalar,
     .divide_exact = divide_exact_scalar,

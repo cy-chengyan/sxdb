@@ -366,9 +366,22 @@ typedef struct alp_constants {
     float64x2_t lower;
 } alp_constants;
 
+static inline alp_constants alp_constants_make(const sx_alp_scales* scales) {
+    alp_constants c = {
+        .encode_exponent = vdupq_n_f64(scales->encode_exponent),
+        .encode_factor = vdupq_n_f64(scales->encode_factor),
+        .decode_factor = vdupq_n_f64(scales->decode_factor),
+        .decode_exponent = vdupq_n_f64(scales->decode_exponent),
+        .magic = vdupq_n_f64(SX_ALP_MAGIC),
+        .magic_bits = vdupq_n_u64(SX_ALP_MAGIC_BITS),
+        .upper = vdupq_n_f64(SX_ALP_ROUND_LIMIT),
+        .lower = vdupq_n_f64(-SX_ALP_ROUND_LIMIT),
+    };
+    return c;
+}
+
 /* Encodes two values; `kept` is all ones in the lanes that round-trip. */
-static inline int64x2_t encode_two(const double* values, const alp_constants* c, uint64x2_t* kept) {
-    float64x2_t value = vld1q_f64(values);
+static inline int64x2_t encode_two(float64x2_t value, const alp_constants* c, uint64x2_t* kept) {
     float64x2_t scaled = vmulq_f64(vmulq_f64(value, c->encode_exponent), c->encode_factor);
     float64x2_t shifted = vaddq_f64(scaled, c->magic);
     float64x2_t decoded =
@@ -440,23 +453,14 @@ static void digit_range_neon(const int64_t* digits, uint32_t count, const uint64
 static uint32_t encode_alp_neon(const double* values, uint32_t count, const sx_alp_scales* scales,
                                 int64_t* digits, uint64_t* exception_bits,
                                 sx_alp_digit_range* range) {
-    alp_constants c = {
-        .encode_exponent = vdupq_n_f64(scales->encode_exponent),
-        .encode_factor = vdupq_n_f64(scales->encode_factor),
-        .decode_factor = vdupq_n_f64(scales->decode_factor),
-        .decode_exponent = vdupq_n_f64(scales->decode_exponent),
-        .magic = vdupq_n_f64(SX_ALP_MAGIC),
-        .magic_bits = vdupq_n_u64(SX_ALP_MAGIC_BITS),
-        .upper = vdupq_n_f64(SX_ALP_ROUND_LIMIT),
-        .lower = vdupq_n_f64(-SX_ALP_ROUND_LIMIT),
-    };
+    alp_constants c = alp_constants_make(scales);
     uint8_t kept_bytes[SX_VECTOR_SIZE / 8];
     uint32_t i = 0;
     for (; i + 8u <= count; i += 8u) {
         uint64x2_t kept[4];
         for (uint32_t k = 0; k < 4u; k++) {
             vst1q_s64(digits + i + k * VECTOR_LANES,
-                      encode_two(values + i + k * VECTOR_LANES, &c, &kept[k]));
+                      encode_two(vld1q_f64(values + i + k * VECTOR_LANES), &c, &kept[k]));
         }
         kept_bytes[i / 8u] = kept_byte(kept);
     }
@@ -466,6 +470,44 @@ static uint32_t encode_alp_neon(const double* values, uint32_t count, const sx_a
     uint32_t exceptions = sx_alp_exceptions_from_kept(kept_bytes, count, exception_bits);
     digit_range_neon(digits, count, exception_bits, range);
     return exceptions;
+}
+
+#define TRIAL_VECTORS (SX_ALP_TRIAL_MAX_VALUES / 2u)
+
+/*
+ * Each pair is tried on the values, copied with zeros after the last one, and lanes past
+ * `count` are masked out of the range and the kept count.
+ */
+static void try_alp_pairs_neon(const double* values, uint32_t count, const sx_alp_scales* scales,
+                               uint32_t pair_count, sx_alp_trial* trials) {
+    uint32_t vectors = sx_div_round_up(count, (uint32_t)VECTOR_LANES);
+    double padded[SX_ALP_TRIAL_MAX_VALUES] = {0};
+    memcpy(padded, values, (size_t)count * sizeof(double));
+    static const uint64_t lane_index[VECTOR_LANES] = {0, 1};
+    uint64x2_t valid[TRIAL_VECTORS];
+    for (uint32_t q = 0; q < vectors; q++) {
+        valid[q] = vcgtq_u64(vdupq_n_u64(count - q * VECTOR_LANES), vld1q_u64(lane_index));
+    }
+    int64x2_t none_min = vdupq_n_s64(INT64_MAX);
+    int64x2_t none_max = vdupq_n_s64(INT64_MIN);
+    for (uint32_t p = 0; p < pair_count; p++) {
+        alp_constants c = alp_constants_make(&scales[p]);
+        int64x2_t min = none_min;
+        int64x2_t max = none_max;
+        uint64x2_t kept_lanes = vdupq_n_u64(0);
+        for (uint32_t q = 0; q < vectors; q++) {
+            uint64x2_t kept;
+            int64x2_t candidate = encode_two(vld1q_f64(padded + q * VECTOR_LANES), &c, &kept);
+            kept = vandq_u64(kept, valid[q]);
+            min = min_i64x2(min, vbslq_s64(kept, candidate, none_min));
+            max = max_i64x2(max, vbslq_s64(kept, candidate, none_max));
+            /* A kept lane is all ones, minus one. */
+            kept_lanes = vsubq_u64(kept_lanes, kept);
+        }
+        trials[p].exceptions = count - (uint32_t)vaddvq_u64(kept_lanes);
+        trials[p].range.min = min_i64(vgetq_lane_s64(min, 0), vgetq_lane_s64(min, 1));
+        trials[p].range.max = max_i64(vgetq_lane_s64(max, 0), vgetq_lane_s64(max, 1));
+    }
 }
 
 /*
@@ -664,6 +706,7 @@ const sx_codec_kernels sx_kernels_neon = {
     .rebuild_deltas = rebuild_deltas_neon,
     .fill_arithmetic = fill_arithmetic_neon,
     .encode_alp = encode_alp_neon,
+    .try_alp_pairs = try_alp_pairs_neon,
     .summarize_ints = summarize_ints_neon,
     .first_non_multiple = first_non_multiple_neon,
     .divide_exact = divide_exact_neon,

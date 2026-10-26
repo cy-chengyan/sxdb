@@ -12,6 +12,7 @@
 
 /* Number of values examined when choosing encoding parameters. */
 #define SAMPLE_SIZE 32u
+_Static_assert(SAMPLE_SIZE <= SX_ALP_TRIAL_MAX_VALUES, "try_alp_pairs takes the whole sample");
 
 /* A full parameter search is repeated at least this often (in chunks)... */
 #define ALP_SEARCH_INTERVAL 64u
@@ -114,20 +115,44 @@ typedef struct alp_choice {
     uint64_t estimated_bits;
 } alp_choice;
 
-/* Estimates the encoded size of the chunk for one exponent/factor pair. */
-static alp_choice estimate_alp(const sample* sampled, uint32_t count, int exponent, int factor) {
-    sx_alp_scales scales = alp_scales(exponent, factor);
-    int64_t digits[SAMPLE_SIZE];
-    uint64_t exception_bits[(SAMPLE_SIZE + 63u) / 64u];
-    sx_alp_digit_range range;
-    uint32_t exceptions = sx_codec_kernels_active()->encode_alp(
-        sampled->values, sampled->size, &scales, digits, exception_bits, &range);
+/* Number of exponent/factor pairs, with factor <= exponent <= ALP_MAX_EXPONENT. */
+#define ALP_PAIR_COUNT ((ALP_MAX_EXPONENT + 1) * (ALP_MAX_EXPONENT + 2) / 2)
+
+/*
+ * Exponent/factor pairs to estimate, collected first so that one kernel call tries them
+ * all on the sample: a call per pair would cost more than the few values it encodes.
+ */
+typedef struct alp_pairs {
+    sx_alp_scales scales[ALP_PAIR_COUNT];
+    uint8_t exponents[ALP_PAIR_COUNT];
+    uint8_t factors[ALP_PAIR_COUNT];
+    sx_alp_trial trials[ALP_PAIR_COUNT];
+    uint32_t count;
+} alp_pairs;
+
+static void alp_pairs_add(alp_pairs* pairs, int exponent, int factor) {
+    pairs->scales[pairs->count] = alp_scales(exponent, factor);
+    pairs->exponents[pairs->count] = (uint8_t)exponent;
+    pairs->factors[pairs->count] = (uint8_t)factor;
+    pairs->count++;
+}
+
+static void alp_pairs_try(alp_pairs* pairs, const sample* sampled) {
+    sx_codec_kernels_active()->try_alp_pairs(sampled->values, sampled->size, pairs->scales,
+                                             pairs->count, pairs->trials);
+}
+
+/* The estimated encoded size of the chunk with pair i, from its trial on the sample. */
+static alp_choice alp_pairs_choice(const alp_pairs* pairs, uint32_t i, const sample* sampled,
+                                   uint32_t count) {
+    const sx_alp_trial* trial = &pairs->trials[i];
     alp_choice choice = {
-        .exponent = exponent,
-        .factor = factor,
-        .sample_exceptions = exceptions,
-        .estimated_bits = (uint64_t)count * alp_width(&range) +
-                          scale_to_chunk(exceptions, sampled->size, count) * ALP_EXCEPTION_BITS,
+        .exponent = pairs->exponents[i],
+        .factor = pairs->factors[i],
+        .sample_exceptions = trial->exceptions,
+        .estimated_bits =
+            (uint64_t)count * alp_width(&trial->range) +
+            scale_to_chunk(trial->exceptions, sampled->size, count) * ALP_EXCEPTION_BITS,
     };
     return choice;
 }
@@ -155,12 +180,18 @@ static void keep_best(alp_choice* best, uint32_t* best_count, alp_choice choice)
  * is given, the best few pairs are remembered for the following chunks.
  */
 static alp_choice search_alp(const sample* sampled, uint32_t count, sx_double_encoder* encoder) {
-    alp_choice best[SX_ALP_CANDIDATES];
-    uint32_t best_count = 0;
+    alp_pairs pairs;
+    pairs.count = 0;
     for (int exponent = 0; exponent <= ALP_MAX_EXPONENT; exponent++) {
         for (int factor = 0; factor <= exponent; factor++) {
-            keep_best(best, &best_count, estimate_alp(sampled, count, exponent, factor));
+            alp_pairs_add(&pairs, exponent, factor);
         }
+    }
+    alp_pairs_try(&pairs, sampled);
+    alp_choice best[SX_ALP_CANDIDATES];
+    uint32_t best_count = 0;
+    for (uint32_t i = 0; i < pairs.count; i++) {
+        keep_best(best, &best_count, alp_pairs_choice(&pairs, i, sampled, count));
     }
     if (encoder != NULL) {
         for (uint32_t i = 0; i < best_count; i++) {
@@ -183,17 +214,20 @@ static alp_choice search_alp(const sample* sampled, uint32_t count, sx_double_en
  */
 static alp_choice best_remembered_alp(const sx_double_encoder* encoder, const sample* sampled,
                                       uint32_t count) {
-    alp_choice best = estimate_alp(sampled, count, encoder->exponents[0], encoder->factors[0]);
-    for (uint32_t i = 1; i < encoder->candidate_count; i++) {
-        alp_choice choice =
-            estimate_alp(sampled, count, encoder->exponents[i], encoder->factors[i]);
-        if (choice.estimated_bits < best.estimated_bits) {
-            best = choice;
-        }
+    alp_pairs pairs;
+    pairs.count = 0;
+    for (uint32_t i = 0; i < encoder->candidate_count; i++) {
+        alp_pairs_add(&pairs, encoder->exponents[i], encoder->factors[i]);
     }
     int remembered_places = encoder->exponents[0] - encoder->factors[0];
     for (int places = 0; places < remembered_places; places++) {
-        alp_choice choice = estimate_alp(sampled, count, places, 0);
+        alp_pairs_add(&pairs, places, 0);
+    }
+    alp_pairs_try(&pairs, sampled);
+    /* The first cheapest pair in this order wins, so ties keep the remembered pairs. */
+    alp_choice best = alp_pairs_choice(&pairs, 0, sampled, count);
+    for (uint32_t i = 1; i < pairs.count; i++) {
+        alp_choice choice = alp_pairs_choice(&pairs, i, sampled, count);
         if (choice.estimated_bits < best.estimated_bits) {
             best = choice;
         }

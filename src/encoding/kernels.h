@@ -52,6 +52,15 @@ typedef struct sx_alp_digit_range {
     int64_t max; /* INT64_MIN if every value is an exception */
 } sx_alp_digit_range;
 
+/* What encoding some values with one exponent/factor pair gives (see try_alp_pairs). */
+typedef struct sx_alp_trial {
+    sx_alp_digit_range range;
+    uint32_t exceptions;
+} sx_alp_trial;
+
+/* Most values try_alp_pairs takes at once. */
+#define SX_ALP_TRIAL_MAX_VALUES 64u
+
 /*
  * Range of a chunk of integers and of its deltas (values[i + 1] - values[i], wrapping
  * modulo 2^64 and read as signed), which decide its encoding (see int_codec.c).
@@ -148,6 +157,15 @@ typedef struct sx_codec_kernels {
      */
     uint32_t (*encode_alp)(const double* values, uint32_t count, const sx_alp_scales* scales,
                            int64_t* digits, uint64_t* exception_bits, sx_alp_digit_range* range);
+
+    /*
+     * Encodes the same `count` values (1 to SX_ALP_TRIAL_MAX_VALUES) with each of the
+     * `pair_count` scales and sets trials[p] to the exception count and digit range that
+     * encode_alp reports with scales[p]. For choosing parameters on a sample, where values
+     * are few and pairs many: the values are loaded once, and nothing is stored per value.
+     */
+    void (*try_alp_pairs)(const double* values, uint32_t count, const sx_alp_scales* scales,
+                          uint32_t pair_count, sx_alp_trial* trials);
 
     /*
      * Fills `summary` for the `count` values and writes their count - 1 deltas to

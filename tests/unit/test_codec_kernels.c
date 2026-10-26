@@ -538,6 +538,59 @@ static void test_encode_alp_matches_scalar(void) {
     }
 }
 
+/*
+ * try_alp_pairs must report what encode_alp reports for each pair: checked for the
+ * portable kernel against encode_alp, and for the others against the portable one, for
+ * every count up to SX_ALP_TRIAL_MAX_VALUES.
+ */
+static void test_try_alp_pairs_matches_encode_alp(void) {
+    const sx_codec_kernels* scalar = level_kernels(SX_SIMD_SCALAR);
+    sx_simd_level levels[SX_SIMD_LEVEL_COUNT];
+    uint32_t level_count = simd_levels(levels);
+    sx_rng rng;
+    sx_rng_seed(&rng, 14);
+    enum { PAIRS = 24 };
+    double values[SX_ALP_TRIAL_MAX_VALUES];
+    sx_alp_scales scales[PAIRS];
+    sx_alp_trial expected[PAIRS];
+    sx_alp_trial actual[PAIRS];
+    int64_t digits[SX_ALP_TRIAL_MAX_VALUES];
+    uint64_t bits[SX_ALP_TRIAL_MAX_VALUES / 64];
+    for (uint32_t round = 0; round < 4u * SX_ALP_TRIAL_MAX_VALUES; round++) {
+        uint32_t count = round % SX_ALP_TRIAL_MAX_VALUES + 1u;
+        for (uint32_t i = 0; i < count; i++) {
+            uint32_t kind = sx_rng_below(&rng, 8) == 0 ? (uint32_t)sx_rng_next(&rng) : round;
+            values[i] = random_double(&rng, kind);
+        }
+        uint32_t pair_count = (uint32_t)sx_rng_below(&rng, PAIRS) + 1u;
+        for (uint32_t p = 0; p < pair_count; p++) {
+            scales[p] = random_scales(&rng);
+        }
+        scalar->try_alp_pairs(values, count, scales, pair_count, expected);
+        for (uint32_t p = 0; p < pair_count; p++) {
+            sx_alp_digit_range range;
+            uint32_t exceptions =
+                scalar->encode_alp(values, count, &scales[p], digits, bits, &range);
+            SX_CHECK_EQ_U64(expected[p].exceptions, exceptions);
+            SX_CHECK_EQ_I64(expected[p].range.min, range.min);
+            SX_CHECK_EQ_I64(expected[p].range.max, range.max);
+        }
+        for (uint32_t l = 0; l < level_count; l++) {
+            const char* name = sx_simd_level_name(levels[l]);
+            level_kernels(levels[l])->try_alp_pairs(values, count, scales, pair_count, actual);
+            for (uint32_t p = 0; p < pair_count; p++) {
+                if (actual[p].exceptions != expected[p].exceptions ||
+                    actual[p].range.min != expected[p].range.min ||
+                    actual[p].range.max != expected[p].range.max) {
+                    sx_test_fail(__FILE__, __LINE__, "%s try_alp_pairs differs: count %u pair %u",
+                                 name, count, p);
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /* ---------------------------------------------------------------------------------------- */
 /* Integer encoding kernels                                                                 */
 /* ---------------------------------------------------------------------------------------- */
@@ -972,6 +1025,7 @@ static const sx_test_case cases[] = {
     {"rebuild_deltas_matches_scalar", test_rebuild_deltas_matches_scalar},
     {"fill_arithmetic_matches_scalar", test_fill_arithmetic_matches_scalar},
     {"encode_alp_matches_scalar", test_encode_alp_matches_scalar},
+    {"try_alp_pairs_matches_encode_alp", test_try_alp_pairs_matches_encode_alp},
     {"summarize_ints_matches_scalar", test_summarize_ints_matches_scalar},
     {"first_non_multiple_matches_scalar", test_first_non_multiple_matches_scalar},
     {"divide_exact_matches_scalar", test_divide_exact_matches_scalar},

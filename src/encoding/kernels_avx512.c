@@ -534,6 +534,45 @@ static void fill_arithmetic_avx512(void* out, uint32_t count, uint64_t first, ui
     }
 }
 
+typedef struct alp_constants {
+    __m512d encode_exponent;
+    __m512d encode_factor;
+    __m512d decode_factor;
+    __m512d decode_exponent;
+    __m512d magic;
+    __m512i magic_bits;
+    __m512d upper;
+    __m512d lower;
+} alp_constants;
+
+static inline alp_constants alp_constants_make(const sx_alp_scales* scales) {
+    alp_constants c = {
+        .encode_exponent = _mm512_set1_pd(scales->encode_exponent),
+        .encode_factor = _mm512_set1_pd(scales->encode_factor),
+        .decode_factor = _mm512_set1_pd(scales->decode_factor),
+        .decode_exponent = _mm512_set1_pd(scales->decode_exponent),
+        .magic = _mm512_set1_pd(SX_ALP_MAGIC),
+        .magic_bits = _mm512_set1_epi64((long long)SX_ALP_MAGIC_BITS),
+        .upper = _mm512_set1_pd(SX_ALP_ROUND_LIMIT),
+        .lower = _mm512_set1_pd(-SX_ALP_ROUND_LIMIT),
+    };
+    return c;
+}
+
+/* Encodes eight values; `kept` has the bits of the lanes that round-trip. */
+static inline __m512i encode_eight(__m512d value, const alp_constants* c, __mmask8* kept) {
+    __m512d scaled = _mm512_mul_pd(_mm512_mul_pd(value, c->encode_exponent), c->encode_factor);
+    __m512d shifted = _mm512_add_pd(scaled, c->magic);
+    __m512d decoded = _mm512_mul_pd(
+        _mm512_mul_pd(_mm512_sub_pd(shifted, c->magic), c->decode_factor), c->decode_exponent);
+    __mmask8 in_range = _mm512_cmp_pd_mask(scaled, c->lower, _CMP_GT_OQ) &
+                        _mm512_cmp_pd_mask(scaled, c->upper, _CMP_LT_OQ);
+    __mmask8 exact =
+        _mm512_cmpeq_epi64_mask(_mm512_castpd_si512(decoded), _mm512_castpd_si512(value));
+    *kept = (__mmask8)(in_range & exact);
+    return _mm512_sub_epi64(_mm512_castpd_si512(shifted), c->magic_bits);
+}
+
 /*
  * Values are encoded 64 at a time, one word of exception bits, which is built in a
  * register and stored once.
@@ -541,14 +580,7 @@ static void fill_arithmetic_avx512(void* out, uint32_t count, uint64_t first, ui
 static uint32_t encode_alp_avx512(const double* values, uint32_t count, const sx_alp_scales* scales,
                                   int64_t* digits, uint64_t* exception_bits,
                                   sx_alp_digit_range* range) {
-    __m512d encode_exponent = _mm512_set1_pd(scales->encode_exponent);
-    __m512d encode_factor = _mm512_set1_pd(scales->encode_factor);
-    __m512d decode_factor = _mm512_set1_pd(scales->decode_factor);
-    __m512d decode_exponent = _mm512_set1_pd(scales->decode_exponent);
-    __m512d magic = _mm512_set1_pd(SX_ALP_MAGIC);
-    __m512i magic_bits = _mm512_set1_epi64((long long)SX_ALP_MAGIC_BITS);
-    __m512d upper = _mm512_set1_pd(SX_ALP_ROUND_LIMIT);
-    __m512d lower = _mm512_set1_pd(-SX_ALP_ROUND_LIMIT);
+    alp_constants c = alp_constants_make(scales);
     __m512i min = _mm512_set1_epi64(INT64_MAX);
     __m512i max = _mm512_set1_epi64(INT64_MIN);
     int64_t tail_min = INT64_MAX;
@@ -561,17 +593,8 @@ static uint32_t encode_alp_avx512(const double* values, uint32_t count, const sx
         uint64_t bits = 0;
         uint32_t i = begin;
         for (; i + VECTOR_LANES <= end; i += VECTOR_LANES) {
-            __m512d value = _mm512_loadu_pd(values + i);
-            __m512d scaled = _mm512_mul_pd(_mm512_mul_pd(value, encode_exponent), encode_factor);
-            __m512d shifted = _mm512_add_pd(scaled, magic);
-            __m512i candidate = _mm512_sub_epi64(_mm512_castpd_si512(shifted), magic_bits);
-            __m512d decoded = _mm512_mul_pd(
-                _mm512_mul_pd(_mm512_sub_pd(shifted, magic), decode_factor), decode_exponent);
-            __mmask8 in_range = _mm512_cmp_pd_mask(scaled, lower, _CMP_GT_OQ) &
-                                _mm512_cmp_pd_mask(scaled, upper, _CMP_LT_OQ);
-            __mmask8 exact =
-                _mm512_cmpeq_epi64_mask(_mm512_castpd_si512(decoded), _mm512_castpd_si512(value));
-            __mmask8 kept = (__mmask8)(in_range & exact);
+            __mmask8 kept;
+            __m512i candidate = encode_eight(_mm512_loadu_pd(values + i), &c, &kept);
             _mm512_storeu_si512(digits + i, candidate);
             bits |= (uint64_t)(uint8_t)~kept << (i - begin);
             min = _mm512_mask_min_epi64(min, kept, min, candidate);
@@ -597,6 +620,40 @@ static uint32_t encode_alp_avx512(const double* values, uint32_t count, const sx
     range->min = vector_min < tail_min ? vector_min : tail_min;
     range->max = vector_max > tail_max ? vector_max : tail_max;
     return exceptions;
+}
+
+#define TRIAL_VECTORS (SX_ALP_TRIAL_MAX_VALUES / 8u)
+
+/*
+ * The values stay in registers (at most eight vectors) while each pair is tried on them.
+ * Lanes past `count` hold zeros and are masked out of the range and the kept count.
+ */
+static void try_alp_pairs_avx512(const double* values, uint32_t count, const sx_alp_scales* scales,
+                                 uint32_t pair_count, sx_alp_trial* trials) {
+    uint32_t vectors = sx_div_round_up(count, (uint32_t)VECTOR_LANES);
+    __m512d v[TRIAL_VECTORS];
+    __mmask8 valid[TRIAL_VECTORS];
+    for (uint32_t q = 0; q < vectors; q++) {
+        valid[q] = first_lanes(count - q * (uint32_t)VECTOR_LANES);
+        v[q] = _mm512_maskz_loadu_pd(valid[q], values + q * VECTOR_LANES);
+    }
+    for (uint32_t p = 0; p < pair_count; p++) {
+        alp_constants c = alp_constants_make(&scales[p]);
+        __m512i min = _mm512_set1_epi64(INT64_MAX);
+        __m512i max = _mm512_set1_epi64(INT64_MIN);
+        uint32_t kept_count = 0;
+        for (uint32_t q = 0; q < vectors; q++) {
+            __mmask8 kept;
+            __m512i candidate = encode_eight(v[q], &c, &kept);
+            kept = (__mmask8)(kept & valid[q]);
+            min = _mm512_mask_min_epi64(min, kept, min, candidate);
+            max = _mm512_mask_max_epi64(max, kept, max, candidate);
+            kept_count += sx_popcount_u64(kept);
+        }
+        trials[p].exceptions = count - kept_count;
+        trials[p].range.min = _mm512_reduce_min_epi64(min);
+        trials[p].range.max = _mm512_reduce_max_epi64(max);
+    }
 }
 
 /* The running minimums and maximums of summarize_ints. */
@@ -864,6 +921,7 @@ const sx_codec_kernels sx_kernels_avx512 = {
     .rebuild_deltas = rebuild_deltas_avx512,
     .fill_arithmetic = fill_arithmetic_avx512,
     .encode_alp = encode_alp_avx512,
+    .try_alp_pairs = try_alp_pairs_avx512,
     .summarize_ints = summarize_ints_avx512,
     .first_non_multiple = first_non_multiple_avx512,
     .divide_exact = divide_exact_avx512,

@@ -393,9 +393,22 @@ typedef struct alp_constants {
     __m256d lower;
 } alp_constants;
 
+static inline alp_constants alp_constants_make(const sx_alp_scales* scales) {
+    alp_constants c = {
+        .encode_exponent = _mm256_set1_pd(scales->encode_exponent),
+        .encode_factor = _mm256_set1_pd(scales->encode_factor),
+        .decode_factor = _mm256_set1_pd(scales->decode_factor),
+        .decode_exponent = _mm256_set1_pd(scales->decode_exponent),
+        .magic = _mm256_set1_pd(SX_ALP_MAGIC),
+        .magic_bits = _mm256_set1_epi64x((long long)SX_ALP_MAGIC_BITS),
+        .upper = _mm256_set1_pd(SX_ALP_ROUND_LIMIT),
+        .lower = _mm256_set1_pd(-SX_ALP_ROUND_LIMIT),
+    };
+    return c;
+}
+
 /* Encodes four values; `kept` is all ones in the lanes that round-trip. */
-static inline __m256i encode_four(const double* values, const alp_constants* c, __m256i* kept) {
-    __m256d value = _mm256_loadu_pd(values);
+static inline __m256i encode_four(__m256d value, const alp_constants* c, __m256i* kept) {
     __m256d scaled = _mm256_mul_pd(_mm256_mul_pd(value, c->encode_exponent), c->encode_factor);
     __m256d shifted = _mm256_add_pd(scaled, c->magic);
     __m256d decoded = _mm256_mul_pd(
@@ -461,23 +474,15 @@ static void digit_range_avx2(const int64_t* digits, uint32_t count, const uint64
 static uint32_t encode_alp_avx2(const double* values, uint32_t count, const sx_alp_scales* scales,
                                 int64_t* digits, uint64_t* exception_bits,
                                 sx_alp_digit_range* range) {
-    alp_constants c = {
-        .encode_exponent = _mm256_set1_pd(scales->encode_exponent),
-        .encode_factor = _mm256_set1_pd(scales->encode_factor),
-        .decode_factor = _mm256_set1_pd(scales->decode_factor),
-        .decode_exponent = _mm256_set1_pd(scales->decode_exponent),
-        .magic = _mm256_set1_pd(SX_ALP_MAGIC),
-        .magic_bits = _mm256_set1_epi64x((long long)SX_ALP_MAGIC_BITS),
-        .upper = _mm256_set1_pd(SX_ALP_ROUND_LIMIT),
-        .lower = _mm256_set1_pd(-SX_ALP_ROUND_LIMIT),
-    };
+    alp_constants c = alp_constants_make(scales);
     uint8_t kept_bytes[SX_VECTOR_SIZE / 8];
     uint32_t i = 0;
     for (; i + 2u * VECTOR_LANES <= count; i += 2u * VECTOR_LANES) {
         __m256i kept0;
         __m256i kept1;
-        store(digits + i, encode_four(values + i, &c, &kept0));
-        store(digits + i + VECTOR_LANES, encode_four(values + i + VECTOR_LANES, &c, &kept1));
+        store(digits + i, encode_four(_mm256_loadu_pd(values + i), &c, &kept0));
+        store(digits + i + VECTOR_LANES,
+              encode_four(_mm256_loadu_pd(values + i + VECTOR_LANES), &c, &kept1));
         kept_bytes[i / 8u] = (uint8_t)(kept_nibble(kept0) | kept_nibble(kept1) << VECTOR_LANES);
     }
     if (i < count) {
@@ -486,6 +491,51 @@ static uint32_t encode_alp_avx2(const double* values, uint32_t count, const sx_a
     uint32_t exceptions = sx_alp_exceptions_from_kept(kept_bytes, count, exception_bits);
     digit_range_avx2(digits, count, exception_bits, range);
     return exceptions;
+}
+
+#define TRIAL_VECTORS (SX_ALP_TRIAL_MAX_VALUES / 4u)
+
+/*
+ * Each pair is tried on the values, copied with zeros after the last one, and lanes past
+ * `count` are masked out of the range and the kept count.
+ */
+static void try_alp_pairs_avx2(const double* values, uint32_t count, const sx_alp_scales* scales,
+                               uint32_t pair_count, sx_alp_trial* trials) {
+    uint32_t vectors = sx_div_round_up(count, (uint32_t)VECTOR_LANES);
+    double padded[SX_ALP_TRIAL_MAX_VALUES] = {0};
+    memcpy(padded, values, (size_t)count * sizeof(double));
+    __m256i valid[TRIAL_VECTORS];
+    for (uint32_t q = 0; q < vectors; q++) {
+        valid[q] = _mm256_cmpgt_epi64(_mm256_set1_epi64x((long long)(count - q * VECTOR_LANES)),
+                                      _mm256_setr_epi64x(0, 1, 2, 3));
+    }
+    __m256i none_min = _mm256_set1_epi64x(INT64_MAX);
+    __m256i none_max = _mm256_set1_epi64x(INT64_MIN);
+    for (uint32_t p = 0; p < pair_count; p++) {
+        alp_constants c = alp_constants_make(&scales[p]);
+        __m256i min = none_min;
+        __m256i max = none_max;
+        uint32_t kept_count = 0;
+        for (uint32_t q = 0; q < vectors; q++) {
+            __m256i kept;
+            __m256i candidate = encode_four(_mm256_loadu_pd(padded + q * VECTOR_LANES), &c, &kept);
+            kept = _mm256_and_si256(kept, valid[q]);
+            min = min_i64x4(min, _mm256_blendv_epi8(none_min, candidate, kept));
+            max = max_i64x4(max, _mm256_blendv_epi8(none_max, candidate, kept));
+            kept_count += sx_popcount_u64(kept_nibble(kept));
+        }
+        int64_t lanes_min[VECTOR_LANES];
+        int64_t lanes_max[VECTOR_LANES];
+        store(lanes_min, min);
+        store(lanes_max, max);
+        sx_alp_trial trial = {.range = {.min = INT64_MAX, .max = INT64_MIN},
+                              .exceptions = count - kept_count};
+        for (uint32_t lane = 0; lane < VECTOR_LANES; lane++) {
+            trial.range.min = lanes_min[lane] < trial.range.min ? lanes_min[lane] : trial.range.min;
+            trial.range.max = lanes_max[lane] > trial.range.max ? lanes_max[lane] : trial.range.max;
+        }
+        trials[p] = trial;
+    }
 }
 
 /* The running minimums and maximums of summarize_ints, for one vector of four lanes. */
@@ -787,6 +837,7 @@ const sx_codec_kernels sx_kernels_avx2 = {
     .rebuild_deltas = rebuild_deltas_avx2,
     .fill_arithmetic = fill_arithmetic_avx2,
     .encode_alp = encode_alp_avx2,
+    .try_alp_pairs = try_alp_pairs_avx2,
     .summarize_ints = summarize_ints_avx2,
     .first_non_multiple = first_non_multiple_avx2,
     .divide_exact = divide_exact_avx2,
