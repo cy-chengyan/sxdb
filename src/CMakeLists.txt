@@ -41,12 +41,23 @@ list(LENGTH sxdb_target_archs sxdb_target_arch_count)
 # because of where the linker puts it, as the codec kernels did. The assembler pads such
 # jumps away for about 2.5% more code; other CPUs are unaffected. Clang takes the option
 # directly, GCC passes it to the GNU assembler (binutils 2.34 and later).
+#
+# The same cache delivers the instructions of one 32-byte window per cycle, so a small loop
+# also runs at a speed that depends on how it falls across those windows. Aligning every
+# function to 64 bytes fixes the place of each loop at compile time: link order and
+# changes elsewhere in the library no longer move codec loops across windows, which made
+# equal code 7 to 24% faster or slower between builds on a Xeon Platinum 8260.
 if(sxdb_target_archs MATCHES "(^|;)(x86_64|AMD64|amd64)(;|$)")
+    include(CheckCCompilerFlag)
     if(sxdb_target_arch_count GREATER 1)
-        # Universal builds need Apple clang, which knows the option.
-        target_compile_options(sxdb PRIVATE "SHELL:-Xarch_x86_64 -mbranches-within-32B-boundaries")
+        # Universal builds need Apple clang, which knows the options.
+        target_compile_options(sxdb PRIVATE "SHELL:-Xarch_x86_64 -mbranches-within-32B-boundaries"
+                                            "SHELL:-Xarch_x86_64 -falign-functions=64")
     else()
-        include(CheckCCompilerFlag)
+        check_c_compiler_flag(-falign-functions=64 SXDB_HAVE_FUNCTION_ALIGNMENT)
+        if(SXDB_HAVE_FUNCTION_ALIGNMENT)
+            target_compile_options(sxdb PRIVATE -falign-functions=64)
+        endif()
         check_c_compiler_flag(-mbranches-within-32B-boundaries SXDB_HAVE_BRANCH_ALIGNMENT)
         if(SXDB_HAVE_BRANCH_ALIGNMENT)
             target_compile_options(sxdb PRIVATE -mbranches-within-32B-boundaries)
